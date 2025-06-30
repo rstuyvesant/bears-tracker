@@ -1,0 +1,10 @@
+pandas
+numpy
+matplotlib
+seaborn
+plotly
+requests
+beautifulsoup4
+lxml
+nbformat
+notebook
