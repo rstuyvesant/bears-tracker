@@ -20,6 +20,17 @@ st.sidebar.header("📤 Upload New Weekly Data")
 uploaded_offense = st.sidebar.file_uploader("Upload Offensive Analytics (.csv)", type="csv")
 uploaded_defense = st.sidebar.file_uploader("Upload Defensive Analytics (.csv)", type="csv")
 uploaded_strategy = st.sidebar.file_uploader("Upload Weekly Strategy (.csv)", type="csv")
+uploaded_personnel = st.sidebar.file_uploader("Upload Personnel Usage (.csv)", type="csv")
+
+if uploaded_personnel:
+
+    df_personnel = pd.read_csv(uploaded_personnel)
+
+    append_to_excel(df_personnel, "Personnel")
+
+    st.sidebar.success("✅ Personnel data uploaded and added.")
+
+
 
 # Process uploaded files
 def append_to_excel(new_df, sheet_name):
