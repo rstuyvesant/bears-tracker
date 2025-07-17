@@ -1,55 +1,68 @@
+
 import streamlit as st
 import pandas as pd
 import os
 
-st.set_page_config(page_title="Chicago Bears 2025–26 Tracker", layout="wide")
+st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
 st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
-st.markdown("Upload new weekly data, view current stats, and export to Excel.")
+st.markdown("Upload weekly CSV data and track performance across the season.")
 
-# Set file paths
-data_files = {
-    "Personnel Usage": "bears_personnel_usage.csv",
-    "Offensive Analytics": "bears_offensive_analytics.csv",
-    "Defensive Analytics": "bears_defensive_analytics.csv",
-    "Weekly Strategy": "bears_weekly_strategy.csv",
-}
+excel_file = "bears_historical_data.xlsx"
 
-# Sidebar for uploads
+# Load existing or create new Excel workbook
+def load_excel():
+    if os.path.exists(excel_file):
+        return pd.ExcelFile(excel_file)
+    return None
+
+# Upload section
 st.sidebar.header("📤 Upload New Weekly Data")
-uploaded_files = {}
+uploaded_offense = st.sidebar.file_uploader("Upload Offensive Analytics (.csv)", type="csv")
+uploaded_defense = st.sidebar.file_uploader("Upload Defensive Analytics (.csv)", type="csv")
+uploaded_strategy = st.sidebar.file_uploader("Upload Weekly Strategy (.csv)", type="csv")
 
-for label, filename in data_files.items():
-    uploaded = st.sidebar.file_uploader(f"Upload {label}", type=["csv"])
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        df.to_csv(filename, index=False)
-        st.sidebar.success(f"{label} uploaded!")
-        uploaded_files[label] = df
-
-# Load and display data
-st.header("📊 Current Weekly Data")
-
-for label, filename in data_files.items():
-    st.subheader(f"📁 {label}")
-    if os.path.exists(filename):
-        df = pd.read_csv(filename)
-        st.dataframe(df)
+# Process uploaded files
+def append_to_excel(new_df, sheet_name):
+    if os.path.exists(excel_file):
+        with pd.ExcelWriter(excel_file, mode="a", engine="openpyxl", if_sheet_exists="overlay") as writer:
+            existing = pd.read_excel(writer, sheet_name=sheet_name) if sheet_name in writer.book.sheetnames else pd.DataFrame()
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            writer.book.remove(writer.book[sheet_name])
+            combined.to_excel(writer, sheet_name=sheet_name, index=False)
     else:
-        st.warning(f"{label} file not found.")
+        with pd.ExcelWriter(excel_file, mode="w", engine="openpyxl") as writer:
+            new_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-# 📥 Export Button
-st.markdown("---")
-if st.button("📤 Export All Data to Excel"):
-    with pd.ExcelWriter("bears_combined_export.xlsx") as writer:
-        for label, filename in data_files.items():
-            if os.path.exists(filename):
-                df = pd.read_csv(filename)
-                df.to_excel(writer, sheet_name=label[:31], index=False)
-    st.success("✅ Exported all data to 'bears_combined_export.xlsx'")
-    with open("bears_combined_export.xlsx", "rb") as f:
+# Handle uploads
+if uploaded_offense:
+    df_off = pd.read_csv(uploaded_offense)
+    append_to_excel(df_off, "Offense")
+    st.success("✅ Offensive data uploaded and added.")
+
+if uploaded_defense:
+    df_def = pd.read_csv(uploaded_defense)
+    append_to_excel(df_def, "Defense")
+    st.success("✅ Defensive data uploaded and added.")
+
+if uploaded_strategy:
+    df_strat = pd.read_csv(uploaded_strategy)
+    append_to_excel(df_strat, "Strategy")
+    st.success("✅ Strategy data uploaded and added.")
+
+# Load Excel file and display
+excel_data = load_excel()
+if excel_data:
+    for sheet in excel_data.sheet_names:
+        df = pd.read_excel(excel_file, sheet_name=sheet)
+        st.subheader(f"📂 {sheet} Data")
+        st.dataframe(df)
+
+    with open(excel_file, "rb") as f:
         st.download_button(
-            label="⬇️ Download Excel File",
+            label="📥 Download Full Excel File",
             data=f,
-            file_name="bears_combined_export.xlsx",
+            file_name=excel_file,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+else:
+    st.info("Upload weekly data files to begin tracking.")
