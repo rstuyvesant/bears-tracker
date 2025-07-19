@@ -100,3 +100,27 @@ if uploaded_strategy:
 if uploaded_personnel:
     st.subheader("Personnel Usage")
     st.dataframe(df_personnel)
+st.markdown("### 📰 Weekly Beat Writer / ESPN Summary")
+
+with st.form("media_form"):
+    media_week = st.number_input("Week", min_value=1, max_value=25, step=1)
+    media_opponent = st.text_input("Opponent")
+    media_summary = st.text_area("Beat Writer & ESPN Summary (Game Recap, Analysis, Strategy, etc.)")
+
+    submit_media = st.form_submit_button("Save Summary")
+
+if submit_media:
+    new_summary = pd.DataFrame([{
+        "Week": media_week,
+        "Opponent": media_opponent,
+        "Summary": media_summary
+    }])
+    append_to_excel(new_summary, "Media")
+    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
+if os.path.exists(EXCEL_FILE):
+    try:
+        media_df = pd.read_excel(EXCEL_FILE, sheet_name="Media")
+        st.subheader("📚 All Media Summaries")
+        st.dataframe(media_df)
+    except:
+        st.info("Media sheet not found yet. Add a summary above.")
