@@ -120,14 +120,50 @@ with st.form("media_form"):
     submit_media = st.form_submit_button("Save Summary")
 
 if submit_media:
-    new_summary = pd.DataFrame([{
+    import openpyxl
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    media_path = EXCEL_FILE
+
+    if os.path.exists(media_path):
+        book = openpyxl.load_workbook(media_path)
+        if "Media" in book.sheetnames:
+            sheet = book["Media"]
+            media_df = pd.DataFrame(sheet.values)
+            media_df.columns = media_df.iloc[0]
+            media_df = media_df[1:]
+        else:
+            media_df = pd.DataFrame(columns=["Week", "Opponent", "Summary"])
+    else:
+        media_df = pd.DataFrame(columns=["Week", "Opponent", "Summary"])
+
+    # Remove duplicate for same Week + Opponent
+    media_df = media_df[~((media_df["Week"] == str(media_week)) & (media_df["Opponent"] == media_opponent))]
+
+    # Add new
+    new_entry = pd.DataFrame([{
         "Week": media_week,
         "Opponent": media_opponent,
         "Summary": media_summary
     }])
-    append_to_excel(new_summary, "Media")
-    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
-if os.path.exists(EXCEL_FILE):
+    updated_df = pd.concat([media_df, new_entry], ignore_index=True)
+
+    # Overwrite Excel
+    if os.path.exists(media_path):
+        book = openpyxl.load_workbook(media_path)
+    else:
+        book = openpyxl.Workbook()
+        book.remove(book.active)
+
+    if "Media" in book.sheetnames:
+        del book["Media"]
+    sheet = book.create_sheet("Media")
+
+    for r in dataframe_to_rows(updated_df, index=False, header=True):
+        sheet.append(r)
+
+    book.save(media_path)
+    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved (no duplicates).")
     try:
         media_df = pd.read_excel(EXCEL_FILE, sheet_name="Media")
         st.subheader("📚 All Media Summaries")
