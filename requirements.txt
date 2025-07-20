@@ -1,3 +1,10 @@
-pandas
-openpyx1
 streamlit
+pandas
+numpy
+matplotlib
+seaborn
+plotly
+requests
+beautifulsoup4
+lxml
+openpyxl
