@@ -84,17 +84,7 @@ if os.path.exists(EXCEL_FILE):
         )
 
 # Optional preview
-# 📢 Beat Writer / ESPN Summary Section
-st.markdown("### 📰 Weekly Beat Writer & ESPN Summaries")
 
-summary_path = "bears_weekly_strategy.xlsx"
-
-if os.path.exists(summary_path):
-    summary_df = pd.read_excel(summary_path)
-    st.dataframe(summary_df[["Week", "Opponent", "Key_Notes", "Next_Week_Impact"]])
-else:
-    st.info("No media summaries found yet. Upload or add them in the Weekly Strategy upload.")
-st.markdown("### 📊 Data Preview (latest upload)")
 if uploaded_offense:
     st.subheader("Offensive Analytics")
     st.dataframe(df_offense)
