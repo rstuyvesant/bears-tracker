@@ -119,32 +119,49 @@ with st.form("media_form"):
 
     submit_media = st.form_submit_button("Save Summary")
 if submit_media:
-    new_summary = pd.DataFrame([{
+    import openpyxl
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    media_path = EXCEL_FILE
+
+    # Load existing summaries
+    if os.path.exists(media_path):
+        try:
+            media_df = pd.read_excel(media_path, sheet_name="Media")
+        except:
+            media_df = pd.DataFrame(columns=["Week", "Opponent", "Summary"])
+    else:
+        media_df = pd.DataFrame(columns=["Week", "Opponent", "Summary"])
+
+    # Create new summary entry
+    new_entry = pd.DataFrame([{
         "Week": media_week,
         "Opponent": media_opponent,
         "Summary": media_summary
     }])
 
-    if os.path.exists(EXCEL_FILE):
-        try:
-            media_df = pd.read_excel(EXCEL_FILE, sheet_name="Media")
-            # Drop existing entry with same Week & Opponent
-            media_df = media_df[
-                ~((media_df["Week"] == media_week) & (media_df["Opponent"] == media_opponent))
-            ]
-            combined_df = pd.concat([media_df, new_summary], ignore_index=True)
-        except:
-            combined_df = new_summary
-    else:
-        combined_df = new_summary
+    # Remove existing summary for same Week and Opponent
+    media_df = media_df[
+        ~((media_df["Week"] == media_week) & (media_df["Opponent"] == media_opponent))
+    ]
 
-    append_to_excel(combined_df, "Media")
-    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
-# Show all saved summaries
-if os.path.exists(EXCEL_FILE):
-    try:
-        media_df = pd.read_excel(EXCEL_FILE, sheet_name="Media")
-        st.subheader("📚 All Media Summaries")
-        st.dataframe(media_df)
-    except:
-        st.info("Media sheet not found yet. Add a summary above.")
+    # Append and deduplicate (extra safety)
+    combined_df = pd.concat([media_df, new_entry], ignore_index=True)
+    combined_df = combined_df.drop_duplicates(subset=["Week", "Opponent"], keep="last")
+
+    # Save to Excel by replacing Media sheet
+    if os.path.exists(media_path):
+        book = openpyxl.load_workbook(media_path)
+    else:
+        book = openpyxl.Workbook()
+        book.remove(book.active)
+
+    if "Media" in book.sheetnames:
+        del book["Media"]
+    sheet = book.create_sheet("Media")
+
+    for r in dataframe_to_rows(combined_df, index=False, header=True):
+        sheet.append(r)
+
+    book.save(media_path)
+    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved (no duplicates).")
