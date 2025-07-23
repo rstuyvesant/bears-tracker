@@ -155,3 +155,29 @@ if submit_media:
 
     book.save(media_path)
     st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved (no duplicates).")
+# 🧠 Predictive Strategy-Based Outcome (Prototype)
+
+st.markdown("### 🔮 Predicted Outcome for Next Game (Experimental)")
+
+try:
+    strategy_df = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
+    latest_week = strategy_df["Week"].max()
+    latest_data = strategy_df[strategy_df["Week"] == latest_week]
+
+    # Example: Use a simple keyword-based score from Key_Notes
+    def basic_prediction(notes):
+        text = notes.lower()
+        if "dominant" in text or "strong pass rush" in text:
+            return "Win"
+        elif "struggled", "injuries", "turnovers" in text:
+            return "Loss"
+        else:
+            return "Too close to call"
+
+    prediction = basic_prediction(" ".join(latest_data["Key_Notes"].astype(str)))
+
+    st.subheader(f"🔍 Predicted outcome for Week {latest_week + 1}: **{prediction}**")
+
+except Exception as e:
+    st.info("Strategy data not available or incomplete for prediction.")
+
