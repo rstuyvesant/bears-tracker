@@ -181,6 +181,87 @@ if os.path.exists(EXCEL_FILE):
         st.dataframe(df_preds)
     except:
         st.info("No predictions saved yet.")
+from fpdf import FPDF
+
+# 📄 Weekly Report PDF Generator
+st.markdown("### 🧾 Download Weekly Game Report (PDF)")
+
+report_week = st.number_input("Select Week for Report", min_value=1, max_value=25, step=1, key="report_week")
+
+if st.button("Generate Weekly Report"):
+    try:
+        # Load all relevant sheets
+        df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
+        df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
+        df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
+        df_media = pd.read_excel(EXCEL_FILE, sheet_name="Media_Summaries")
+        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
+
+        # Get rows for selected week
+        strat_row = df_strategy[df_strategy["Week"] == report_week]
+        off_row = df_offense[df_offense["Week"] == report_week]
+        def_row = df_defense[df_defense["Week"] == report_week]
+        media_rows = df_media[df_media["Week"] == report_week]
+        pred_row = df_preds[df_preds["Week"] == report_week]
+
+        # Create PDF report
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, f"Chicago Bears Weekly Report – Week {report_week}", ln=True)
+
+        pdf.set_font("Arial", "", 12)
+
+        # Opponent and Prediction
+        if not pred_row.empty:
+            outcome = pred_row.iloc[0]["Prediction"]
+            reason = pred_row.iloc[0]["Reason"]
+            pdf.multi_cell(0, 10, f"🔮 Prediction: {outcome}\n📝 Reason: {reason}\n")
+
+        # Strategy
+        if not strat_row.empty:
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "📘 Strategy Notes:", ln=True)
+            pdf.set_font("Arial", "", 12)
+            strategy_text = strat_row.iloc[0].astype(str).str.cat(sep=" | ")
+            pdf.multi_cell(0, 10, strategy_text)
+
+        # Offense Stats
+        if not off_row.empty:
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "📊 Offensive Analytics:", ln=True)
+            pdf.set_font("Arial", "", 12)
+            for col, val in off_row.iloc[0].items():
+                pdf.cell(0, 8, f"{col}: {val}", ln=True)
+
+        # Defense Stats
+        if not def_row.empty:
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "🛡️ Defensive Analytics:", ln=True)
+            pdf.set_font("Arial", "", 12)
+            for col, val in def_row.iloc[0].items():
+                pdf.cell(0, 8, f"{col}: {val}", ln=True)
+
+        # Media Summaries
+        if not media_rows.empty:
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "📰 Media Summaries:", ln=True)
+            pdf.set_font("Arial", "", 12)
+            for idx, row in media_rows.iterrows():
+                source = row.get("Opponent", "Source")
+                summary = row.get("Summary", "")
+                pdf.multi_cell(0, 10, f"{source}:\n{summary}\n")
+
+        # Save and offer download
+        pdf_output = f"week_{report_week}_report.pdf"
+        pdf.output(pdf_output)
+        with open(pdf_output, "rb") as f:
+            st.download_button(
+                label=f"📥 Download Week {report_week} Report (PDF)",
+                data=f,
+                file_name=pdf_output,
+                mime="application/pdf"
+            )
 
 
 
