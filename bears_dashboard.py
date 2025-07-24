@@ -9,7 +9,7 @@ st.markdown("Track weekly stats, strategy, personnel usage, and league compariso
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
 
 # Append new data to Excel workbook
-def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE):
+def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True):
     import openpyxl
     from openpyxl.utils.dataframe import dataframe_to_rows
 
@@ -21,8 +21,7 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE):
             existing_data.columns = existing_data.iloc[0]
             existing_data = existing_data[1:]
 
-            # Drop duplicate week if it exists
-            if "Week" in existing_data.columns and "Week" in new_data.columns:
+            if deduplicate and "Week" in existing_data.columns and "Week" in new_data.columns:
                 existing_data = existing_data[existing_data["Week"] != str(new_data.iloc[0]["Week"])]
             combined_data = pd.concat([existing_data, new_data], ignore_index=True)
         else:
@@ -102,7 +101,6 @@ with st.form("media_form"):
     media_week = st.number_input("Week", min_value=1, max_value=25, step=1)
     media_opponent = st.text_input("Opponent")
     media_summary = st.text_area("Beat Writer & ESPN Summary (Game Recap, Analysis, Strategy, etc.)")
-
     submit_media = st.form_submit_button("Save Summary")
 
 if submit_media:
@@ -111,7 +109,7 @@ if submit_media:
         "Opponent": media_opponent,
         "Summary": media_summary
     }])
-    append_to_excel(media_df, "Media_Summaries")
+    append_to_excel(media_df, "Media_Summaries", deduplicate=False)  # No deduplication here
     st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
 
 # Preview stored media summaries
