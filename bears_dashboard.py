@@ -173,6 +173,14 @@ try:
 except Exception as e:
     st.warning("Prediction could not be generated. Make sure all files are uploaded with a 'Week' column.")
 
+# 📈 Preview saved predictions
+if os.path.exists(EXCEL_FILE):
+    try:
+        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
+        st.subheader("📈 Saved Game Predictions")
+        st.dataframe(df_preds)
+    except:
+        st.info("No predictions saved yet.")
 
 
 
