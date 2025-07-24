@@ -140,7 +140,6 @@ try:
     if not row_s.empty and not row_o.empty and not row_d.empty:
         strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
 
-        # Pull a few numeric fields if they exist
         try:
             ypa = float(row_o.iloc[0].get("YPA", 0))
             red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
@@ -148,7 +147,7 @@ try:
         except:
             ypa = red_zone_allowed = sacks = 0
 
-        # Simple rules for prediction
+        # Prediction rules
         if "blitz" in strategy_text and sacks >= 3:
             prediction = "Win – pressure defense likely disrupts opponent"
         elif ypa < 6 and red_zone_allowed > 65:
@@ -160,13 +159,19 @@ try:
 
         st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
 
+        # Save prediction to Excel
+        prediction_entry = pd.DataFrame([{
+            "Week": week_to_predict,
+            "Prediction": prediction.split("–")[0].strip(),
+            "Reason": prediction.split("–")[1].strip() if "–" in prediction else ""
+        }])
+        append_to_excel(prediction_entry, "Predictions", deduplicate=True)
+
     else:
         st.info("Please upload Strategy, Offense, and Defense data for this week.")
 
 except Exception as e:
     st.warning("Prediction could not be generated. Make sure all files are uploaded with a 'Week' column.")
-
-
 
 
 
