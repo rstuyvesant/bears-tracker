@@ -134,7 +134,51 @@ if os.path.exists(EXCEL_FILE):
         df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
         df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
 
-        row_s = df_strategy[df_strategy["Week"] == week
+        row_s = df_strategy[df_strategy["Week"] == week_to_predict]
+        row_o = df_offense[df_offense["Week"] == week_to_predict]
+        row_d = df_defense[df_defense["Week"] == week_to_predict]
+
+        if not row_s.empty and not row_o.empty and not row_d.empty:
+            strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
+            try:
+                ypa = float(row_o.iloc[0].get("YPA", 0))
+                red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
+                sacks = int(row_d.iloc[0].get("SACK", 0))
+            except:
+                ypa = red_zone_allowed = sacks = 0
+
+            if "blitz" in strategy_text and sacks >= 3:
+                prediction = "Win – pressure defense likely disrupts opponent"
+            elif ypa < 6 and red_zone_allowed > 65:
+                prediction = "Loss – inefficient passing and weak red zone defense"
+            elif "zone" in strategy_text and red_zone_allowed < 50:
+                prediction = "Win – disciplined zone and red zone efficiency"
+            elif any(word in strategy_text for word in ["struggled", "injuries", "turnovers"]):
+                prediction = "Loss – opponent issues likely to affect performance"
+            else:
+                prediction = "Loss – no clear advantage in key strategy or stats"
+
+            st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
+
+            prediction_entry = pd.DataFrame([{
+                "Week": week_to_predict,
+                "Prediction": prediction.split("–")[0].strip(),
+                "Reason": prediction.split("–")[1].strip() if "–" in prediction else ""
+            }])
+            append_to_excel(prediction_entry, "Predictions", deduplicate=True)
+        else:
+            st.info("Missing data for that week.")
+    except Exception as e:
+        st.warning("Prediction failed. Check uploaded data.")
+
+# Show saved predictions
+if os.path.exists(EXCEL_FILE):
+    try:
+        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
+        st.subheader("📈 Saved Game Predictions")
+        st.dataframe(df_preds)
+    except:
+        st.info("
 
 
 
