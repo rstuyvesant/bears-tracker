@@ -178,7 +178,7 @@ if os.path.exists(EXCEL_FILE):
         st.subheader("📈 Saved Game Predictions")
         st.dataframe(df_preds)
     except:
-        st.info("
+        st.info("No predictions saved yet.")
 
 
 
