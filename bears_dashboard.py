@@ -14,32 +14,35 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
     import openpyxl
     from openpyxl.utils.dataframe import dataframe_to_rows
 
-    if os.path.exists(file_name):
-        book = openpyxl.load_workbook(file_name)
-        if sheet_name in book.sheetnames:
-            sheet = book[sheet_name]
-            existing_data = pd.DataFrame(sheet.values)
-            existing_data.columns = existing_data.iloc[0]
-            existing_data = existing_data[1:]
+    try:
+        if os.path.exists(file_name):
+            book = openpyxl.load_workbook(file_name)
+            if sheet_name in book.sheetnames:
+                sheet = book[sheet_name]
+                existing_data = pd.DataFrame(sheet.values)
+                existing_data.columns = existing_data.iloc[0]
+                existing_data = existing_data[1:]
 
-            if deduplicate and "Week" in existing_data.columns and "Week" in new_data.columns:
-                existing_data = existing_data[existing_data["Week"] != str(new_data.iloc[0]["Week"])]
-            combined_data = pd.concat([existing_data, new_data], ignore_index=True)
+                if deduplicate and "Week" in existing_data.columns and "Week" in new_data.columns:
+                    existing_data = existing_data[existing_data["Week"] != str(new_data.iloc[0]["Week"])]
+                combined_data = pd.concat([existing_data, new_data], ignore_index=True)
+            else:
+                combined_data = new_data
         else:
+            book = openpyxl.Workbook()
+            book.remove(book.active)
             combined_data = new_data
-    else:
-        book = openpyxl.Workbook()
-        book.remove(book.active)
-        combined_data = new_data
 
-    if sheet_name in book.sheetnames:
-        del book[sheet_name]
-    sheet = book.create_sheet(sheet_name)
+        if sheet_name in book.sheetnames:
+            del book[sheet_name]
+        sheet = book.create_sheet(sheet_name)
 
-    for r in dataframe_to_rows(combined_data, index=False, header=True):
-        sheet.append(r)
+        for r in dataframe_to_rows(combined_data, index=False, header=True):
+            sheet.append(r)
 
-    book.save(file_name)
+        book.save(file_name)
+    except Exception as e:
+        st.error(f"Excel append error: {e}")
 
 # Sidebar upload
 st.sidebar.header("📤 Upload New Weekly Data")
@@ -131,151 +134,7 @@ if os.path.exists(EXCEL_FILE):
         df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
         df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
 
-        row_s = df_strategy[df_strategy["Week"] == week_to_predict]
-        row_o = df_offense[df_offense["Week"] == week_to_predict]
-        row_d = df_defense[df_defense["Week"] == week_to_predict]
-
-        if not row_s.empty and not row_o.empty and not row_d.empty:
-            strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
-            try:
-                ypa = float(row_o.iloc[0].get("YPA", 0))
-                red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
-                sacks = int(row_d.iloc[0].get("SACK", 0))
-            except:
-                ypa = red_zone_allowed = sacks = 0
-
-            if "blitz" in strategy_text and sacks >= 3:
-                prediction = "Win – pressure defense likely disrupts opponent"
-            elif ypa < 6 and red_zone_allowed > 65:
-                prediction = "Loss – inefficient passing and weak red zone defense"
-            elif "zone" in strategy_text and red_zone_allowed < 50:
-                prediction = "Win – disciplined zone and red zone efficiency"
-            else:
-                prediction = "Loss – no clear advantage in key strategy or stats"
-
-            st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
-
-            prediction_entry = pd.DataFrame([{
-                "Week": week_to_predict,
-                "Prediction": prediction.split("–")[0].strip(),
-                "Reason": prediction.split("–")[1].strip() if "–" in prediction else ""
-            }])
-            append_to_excel(prediction_entry, "Predictions", deduplicate=True)
-        else:
-            st.info("Missing data for that week.")
-    except Exception as e:
-        st.warning("Prediction failed. Check uploaded data.")
-
-# Show saved predictions
-if os.path.exists(EXCEL_FILE):
-    try:
-        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
-        st.subheader("📈 Saved Game Predictions")
-        st.dataframe(df_preds)
-    except:
-        st.info("No predictions saved yet.")
-
-# PDF Report Generator
-st.markdown("### 🧾 Download Weekly Game Report (PDF)")
-report_week = st.number_input("Select Week for Report", min_value=1, max_value=25, step=1, key="report_week")
-
-if st.button("Generate Weekly Report"):
-    try:
-        df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
-        df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
-        df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
-        df_media = pd.read_excel(EXCEL_FILE, sheet_name="Media_Summaries")
-        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
-
-        strat_row = df_strategy[df_strategy["Week"] == report_week]
-        off_row = df_offense[df_offense["Week"] == report_week]
-        def_row = df_defense[df_defense["Week"] == report_week]
-        media_rows = df_media[df_media["Week"] == report_week]
-        pred_row = df_preds[df_preds["Week"] == report_week]
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(0, 10, f"Chicago Bears Weekly Report – Week {report_week}", ln=True)
-
-        pdf.set_font("Arial", "", 12)
-
-        if not pred_row.empty:
-            outcome = pred_row.iloc[0]["Prediction"]
-            reason = pred_row.iloc[0]["Reason"]
-            pdf.multi_cell(0, 10, f"🔮 Prediction: {outcome}\n📝 Reason: {reason}\n")
-
-        if not strat_row.empty:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "📘 Strategy Notes:", ln=True)
-            pdf.set_font("Arial", "", 12)
-            strategy_text = strat_row.iloc[0].astype(str).str.cat(sep=" | ")
-            pdf.multi_cell(0, 10, strategy_text)
-
-        if not off_row.empty:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "📊 Offensive Analytics:", ln=True)
-            pdf.set_font("Arial", "", 12)
-            for col, val in off_row.iloc[0].items():
-                pdf.cell(0, 8, f"{col}: {val}", ln=True)
-
-        if not def_row.empty:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "🛡️ Defensive Analytics:", ln=True)
-            pdf.set_font("Arial", "", 12)
-            for col, val in def_row.iloc[0].items():
-                pdf.cell(0, 8, f"{col}: {val}", ln=True)
-
-        if not media_rows.empty:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "📰 Media Summaries:", ln=True)
-            pdf.set_font("Arial", "", 12)
-            for idx, row in media_rows.iterrows():
-                source = row.get("Opponent", "Source")
-                summary = row.get("Summary", "")
-                pdf.multi_cell(0, 10, f"{source}:\n{summary}\n")
-
-        pdf_output = f"week_{report_week}_report.pdf"
-        pdf.output(pdf_output)
-        with open(pdf_output, "rb") as f:
-            st.download_button(
-                label=f"📥 Download Week {report_week} Report (PDF)",
-                data=f,
-                file_name=pdf_output,
-                mime="application/pdf"
-            )
-    except Exception as e:
-        st.error("❌ Failed to generate PDF. Check your data.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        row_s = df_strategy[df_strategy["Week"] == week
 
 
 
