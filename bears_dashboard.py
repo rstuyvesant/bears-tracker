@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+from fpdf import FPDF
 
 st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
 st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
@@ -40,7 +41,7 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
 
     book.save(file_name)
 
-# Upload section
+# Sidebar upload
 st.sidebar.header("📤 Upload New Weekly Data")
 uploaded_offense = st.sidebar.file_uploader("Upload Offensive Analytics (.csv)", type="csv")
 uploaded_defense = st.sidebar.file_uploader("Upload Defensive Analytics (.csv)", type="csv")
@@ -50,24 +51,24 @@ uploaded_personnel = st.sidebar.file_uploader("Upload Personnel Usage (.csv)", t
 if uploaded_offense:
     df_offense = pd.read_csv(uploaded_offense)
     append_to_excel(df_offense, "Offense")
-    st.sidebar.success("✅ Offensive data uploaded and added.")
+    st.sidebar.success("✅ Offensive data uploaded.")
 
 if uploaded_defense:
     df_defense = pd.read_csv(uploaded_defense)
     append_to_excel(df_defense, "Defense")
-    st.sidebar.success("✅ Defensive data uploaded and added.")
+    st.sidebar.success("✅ Defensive data uploaded.")
 
 if uploaded_strategy:
     df_strategy = pd.read_csv(uploaded_strategy)
     append_to_excel(df_strategy, "Strategy")
-    st.sidebar.success("✅ Strategy data uploaded and added.")
+    st.sidebar.success("✅ Strategy data uploaded.")
 
 if uploaded_personnel:
     df_personnel = pd.read_csv(uploaded_personnel)
     append_to_excel(df_personnel, "Personnel")
-    st.sidebar.success("✅ Personnel data uploaded and added.")
+    st.sidebar.success("✅ Personnel data uploaded.")
 
-# Download full Excel data
+# Download Excel
 if os.path.exists(EXCEL_FILE):
     with open(EXCEL_FILE, "rb") as f:
         st.sidebar.download_button(
@@ -77,7 +78,7 @@ if os.path.exists(EXCEL_FILE):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# Preview uploaded data
+# Show uploaded data
 if uploaded_offense:
     st.subheader("Offensive Analytics")
     st.dataframe(df_offense)
@@ -94,9 +95,8 @@ if uploaded_personnel:
     st.subheader("Personnel Usage")
     st.dataframe(df_personnel)
 
-# Add & view media summaries
+# Media Summary Section
 st.markdown("### 📰 Weekly Beat Writer / ESPN Summary")
-
 with st.form("media_form"):
     media_week = st.number_input("Week", min_value=1, max_value=25, step=1, key="media_week_input")
     media_opponent = st.text_input("Opponent")
@@ -112,68 +112,61 @@ if submit_media:
     append_to_excel(media_df, "Media_Summaries", deduplicate=False)
     st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
 
-# Preview stored media summaries
+# Show media summaries
 if os.path.exists(EXCEL_FILE):
     try:
         df_media = pd.read_excel(EXCEL_FILE, sheet_name="Media_Summaries")
         st.subheader("📰 Saved Media Summaries")
         st.dataframe(df_media)
     except:
-        st.info("No media summaries stored yet.")
+        st.info("No media summaries found.")
 
-# 🔮 Weekly Game Prediction
+# Prediction Section
 st.markdown("### 🔮 Weekly Game Prediction")
-
-# Let user choose which week to predict
 week_to_predict = st.number_input("Select Week to Predict", min_value=1, max_value=25, step=1, key="predict_week_input")
 
-# Load uploaded strategy and analytics
-try:
-    df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
-    df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
-    df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
+if os.path.exists(EXCEL_FILE):
+    try:
+        df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
+        df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
+        df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
 
-    row_s = df_strategy[df_strategy["Week"] == week_to_predict]
-    row_o = df_offense[df_offense["Week"] == week_to_predict]
-    row_d = df_defense[df_defense["Week"] == week_to_predict]
+        row_s = df_strategy[df_strategy["Week"] == week_to_predict]
+        row_o = df_offense[df_offense["Week"] == week_to_predict]
+        row_d = df_defense[df_defense["Week"] == week_to_predict]
 
-    if not row_s.empty and not row_o.empty and not row_d.empty:
-        strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
+        if not row_s.empty and not row_o.empty and not row_d.empty:
+            strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
+            try:
+                ypa = float(row_o.iloc[0].get("YPA", 0))
+                red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
+                sacks = int(row_d.iloc[0].get("SACK", 0))
+            except:
+                ypa = red_zone_allowed = sacks = 0
 
-        try:
-            ypa = float(row_o.iloc[0].get("YPA", 0))
-            red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
-            sacks = int(row_d.iloc[0].get("SACK", 0))
-        except:
-            ypa = red_zone_allowed = sacks = 0
+            if "blitz" in strategy_text and sacks >= 3:
+                prediction = "Win – pressure defense likely disrupts opponent"
+            elif ypa < 6 and red_zone_allowed > 65:
+                prediction = "Loss – inefficient passing and weak red zone defense"
+            elif "zone" in strategy_text and red_zone_allowed < 50:
+                prediction = "Win – disciplined zone and red zone efficiency"
+            else:
+                prediction = "Loss – no clear advantage in key strategy or stats"
 
-        # Prediction rules
-        if "blitz" in strategy_text and sacks >= 3:
-            prediction = "Win – pressure defense likely disrupts opponent"
-        elif ypa < 6 and red_zone_allowed > 65:
-            prediction = "Loss – inefficient passing and weak red zone defense"
-        elif "zone" in strategy_text and red_zone_allowed < 50:
-            prediction = "Win – disciplined zone and red zone efficiency"
+            st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
+
+            prediction_entry = pd.DataFrame([{
+                "Week": week_to_predict,
+                "Prediction": prediction.split("–")[0].strip(),
+                "Reason": prediction.split("–")[1].strip() if "–" in prediction else ""
+            }])
+            append_to_excel(prediction_entry, "Predictions", deduplicate=True)
         else:
-            prediction = "Loss – no clear advantage in key strategy or stats"
+            st.info("Missing data for that week.")
+    except Exception as e:
+        st.warning("Prediction failed. Check uploaded data.")
 
-        st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
-
-        # Save prediction to Excel
-        prediction_entry = pd.DataFrame([{
-            "Week": week_to_predict,
-            "Prediction": prediction.split("–")[0].strip(),
-            "Reason": prediction.split("–")[1].strip() if "–" in prediction else ""
-        }])
-        append_to_excel(prediction_entry, "Predictions", deduplicate=True)
-
-    else:
-        st.info("Please upload Strategy, Offense, and Defense data for this week.")
-
-except Exception as e:
-    st.warning("Prediction could not be generated. Make sure all files are uploaded with a 'Week' column.")
-
-# 📈 Preview saved predictions
+# Show saved predictions
 if os.path.exists(EXCEL_FILE):
     try:
         df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
@@ -181,30 +174,25 @@ if os.path.exists(EXCEL_FILE):
         st.dataframe(df_preds)
     except:
         st.info("No predictions saved yet.")
-from fpdf import FPDF
 
-# 📄 Weekly Report PDF Generator
+# PDF Report Generator
 st.markdown("### 🧾 Download Weekly Game Report (PDF)")
-
 report_week = st.number_input("Select Week for Report", min_value=1, max_value=25, step=1, key="report_week")
 
 if st.button("Generate Weekly Report"):
     try:
-        # Load all relevant sheets
         df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
         df_offense = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
         df_defense = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
         df_media = pd.read_excel(EXCEL_FILE, sheet_name="Media_Summaries")
         df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
 
-        # Get rows for selected week
         strat_row = df_strategy[df_strategy["Week"] == report_week]
         off_row = df_offense[df_offense["Week"] == report_week]
         def_row = df_defense[df_defense["Week"] == report_week]
         media_rows = df_media[df_media["Week"] == report_week]
         pred_row = df_preds[df_preds["Week"] == report_week]
 
-        # Create PDF report
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", "B", 16)
@@ -212,13 +200,11 @@ if st.button("Generate Weekly Report"):
 
         pdf.set_font("Arial", "", 12)
 
-        # Opponent and Prediction
         if not pred_row.empty:
             outcome = pred_row.iloc[0]["Prediction"]
             reason = pred_row.iloc[0]["Reason"]
             pdf.multi_cell(0, 10, f"🔮 Prediction: {outcome}\n📝 Reason: {reason}\n")
 
-        # Strategy
         if not strat_row.empty:
             pdf.set_font("Arial", "B", 12)
             pdf.cell(0, 10, "📘 Strategy Notes:", ln=True)
@@ -226,7 +212,6 @@ if st.button("Generate Weekly Report"):
             strategy_text = strat_row.iloc[0].astype(str).str.cat(sep=" | ")
             pdf.multi_cell(0, 10, strategy_text)
 
-        # Offense Stats
         if not off_row.empty:
             pdf.set_font("Arial", "B", 12)
             pdf.cell(0, 10, "📊 Offensive Analytics:", ln=True)
@@ -234,7 +219,6 @@ if st.button("Generate Weekly Report"):
             for col, val in off_row.iloc[0].items():
                 pdf.cell(0, 8, f"{col}: {val}", ln=True)
 
-        # Defense Stats
         if not def_row.empty:
             pdf.set_font("Arial", "B", 12)
             pdf.cell(0, 10, "🛡️ Defensive Analytics:", ln=True)
@@ -242,7 +226,6 @@ if st.button("Generate Weekly Report"):
             for col, val in def_row.iloc[0].items():
                 pdf.cell(0, 8, f"{col}: {val}", ln=True)
 
-        # Media Summaries
         if not media_rows.empty:
             pdf.set_font("Arial", "B", 12)
             pdf.cell(0, 10, "📰 Media Summaries:", ln=True)
@@ -252,7 +235,6 @@ if st.button("Generate Weekly Report"):
                 summary = row.get("Summary", "")
                 pdf.multi_cell(0, 10, f"{source}:\n{summary}\n")
 
-        # Save and offer download
         pdf_output = f"week_{report_week}_report.pdf"
         pdf.output(pdf_output)
         with open(pdf_output, "rb") as f:
@@ -262,20 +244,8 @@ if st.button("Generate Weekly Report"):
                 file_name=pdf_output,
                 mime="application/pdf"
             )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    except Exception as e:
+        st.error("❌ Failed to generate PDF. Check your data.")
 
 
 
