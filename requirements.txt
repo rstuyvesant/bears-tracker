@@ -3,4 +3,5 @@ pandas
 openpyxl
 fpdf
 nfl_data_py
-nflfastR
+pyarrow
+fastparquet
