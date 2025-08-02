@@ -22,7 +22,6 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
                 existing_data = pd.DataFrame(sheet.values)
                 existing_data.columns = existing_data.iloc[0]
                 existing_data = existing_data[1:]
-
                 if deduplicate and "Week" in existing_data.columns and "Week" in new_data.columns:
                     existing_data = existing_data[existing_data["Week"] != str(new_data.iloc[0]["Week"])]
                 combined_data = pd.concat([existing_data, new_data], ignore_index=True)
@@ -71,7 +70,7 @@ if uploaded_personnel:
     append_to_excel(df_personnel, "Personnel")
     st.sidebar.success("✅ Personnel data uploaded.")
 
-# ----- Fetch weekly data via nfl_data_py -----
+# ----- Fetch weekly team data via nfl_data_py (basic Offense/Defense rows) -----
 with st.sidebar.expander("⚡ Fetch Weekly Data (nfl_data_py)"):
     st.caption("Pulls 2025 weekly team stats for CHI and saves to Excel.")
     fetch_week = st.number_input(
@@ -161,9 +160,75 @@ with st.sidebar.expander("⚡ Fetch Weekly Data (nfl_data_py)"):
                 append_to_excel(team_week.rename(columns=str), "Raw_Weekly", deduplicate=False)
 
                 st.success(f"✅ Added CHI week {wk} to Offense/Defense (available fields).")
-                st.caption("Note: Red Zone % Allowed and pressures require play-by-play aggregation; we can add that next.")
+                st.caption("Note: Red Zone % Allowed and pressures require play-by-play aggregation; see panel below.")
         except Exception as e:
             st.error(f"Fetch failed: {e}")
+
+# ----- Fetch PBP-derived defensive metrics (RZ% Allowed, Success Rate, Pressures) -----
+st.sidebar.markdown("### 📡 Fetch Defensive Metrics from Play-by-Play")
+pbp_week = st.sidebar.number_input("Week to Fetch (2025 Season)", min_value=1, max_value=25, value=1, step=1, key="pbp_week_2025")
+
+if st.sidebar.button("Fetch Play-by-Play Metrics"):
+    try:
+        import nfl_data_py as nfl
+
+        # Pull play-by-play for the season (filter by week + CHI on defense)
+        pbp = nfl.import_pbp_data([2025], downcast=False)
+        pbp_w = pbp[(pbp["week"] == int(pbp_week)) & (pbp["defteam"] == "CHI")].copy()
+
+        if pbp_w.empty:
+            st.warning("No PBP rows for CHI defense in that week yet. Try again later.")
+        else:
+            # --- Red Zone % Allowed ---
+            # Identify unique drives by game_id + drive, find min yardline achieved
+            dmins = (
+                pbp_w.groupby(["game_id", "drive"], as_index=False)["yardline_100"]
+                .min()
+                .rename(columns={"yardline_100": "min_yardline_100"})
+            )
+            total_drives = len(dmins)
+            rz_drives = len(dmins[dmins["min_yardline_100"] <= 20]) if total_drives > 0 else 0
+            rz_allowed = (rz_drives / total_drives * 100) if total_drives > 0 else 0.0
+
+            # --- Success Rate (offense success %) ---
+            def play_success(row):
+                if pd.isna(row.get("down")) or pd.isna(row.get("ydstogo")) or pd.isna(row.get("yards_gained")):
+                    return False
+                d = int(row["down"])
+                togo = float(row["ydstogo"])
+                gain = float(row["yards_gained"])
+                if d == 1:
+                    return gain >= 0.4 * togo
+                elif d == 2:
+                    return gain >= 0.6 * togo
+                else:
+                    return gain >= togo
+
+            plays_mask = (~pbp_w["play_type"].isin(["no_play"])) & (~pbp_w["penalty"].fillna(False))
+            pbp_real = pbp_w[plays_mask].copy()
+            success_rate = pbp_real.apply(play_success, axis=1).mean() * 100 if len(pbp_real) else 0.0
+
+            # --- Pressures approximation: QB hits + sacks ---
+            qb_hits = pbp_w["qb_hit"].fillna(0).astype(int).sum() if "qb_hit" in pbp_w.columns else 0
+            sacks = pbp_w["sack"].fillna(0).astype(int).sum() if "sack" in pbp_w.columns else 0
+            pressures = int(qb_hits + sacks)
+
+            # Save into a dedicated sheet
+            metrics_df = pd.DataFrame([{
+                "Week": int(pbp_week),
+                "RZ% Allowed": round(rz_allowed, 1),
+                "Success Rate% (Offense)": round(success_rate, 1),
+                "Pressures": pressures
+            }])
+            append_to_excel(metrics_df, "Advanced_Defense", deduplicate=True)
+
+            st.success(
+                f"✅ Week {int(pbp_week)} PBP metrics saved — RZ% Allowed: {rz_allowed:.1f} | "
+                f"Success Rate% (Off): {success_rate:.1f} | Pressures: {pressures}"
+            )
+            st.caption("Note: Hurries aren’t separately flagged in standard PBP; pressures = sacks + QB hits.")
+    except Exception as e:
+        st.error(f"❌ Failed to fetch metrics: {e}")
 
 # Download Excel
 if os.path.exists(EXCEL_FILE):
@@ -215,7 +280,7 @@ if os.path.exists(EXCEL_FILE):
         df_media = pd.read_excel(EXCEL_FILE, sheet_name="Media_Summaries")
         st.subheader("📰 Saved Media Summaries")
         st.dataframe(df_media)
-    except:
+    except Exception:
         st.info("No media summaries found.")
 
 # Prediction Section
@@ -238,7 +303,7 @@ if os.path.exists(EXCEL_FILE):
                 ypa = float(row_o.iloc[0].get("YPA", 0))
                 red_zone_allowed = float(row_d.iloc[0].get("RZ% Allowed", 0))
                 sacks = int(row_d.iloc[0].get("SACK", 0))
-            except:
+            except Exception:
                 ypa = red_zone_allowed = sacks = 0
 
             if "blitz" in strategy_text and sacks >= 3:
@@ -263,7 +328,7 @@ if os.path.exists(EXCEL_FILE):
         else:
             st.info("Missing data for that week.")
     except Exception as e:
-        st.warning("Prediction failed. Check uploaded data.")
+        st.warning(f"Prediction failed. Check uploaded data. Error: {e}")
 
 # Show saved predictions
 if os.path.exists(EXCEL_FILE):
@@ -271,5 +336,5 @@ if os.path.exists(EXCEL_FILE):
         df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
         st.subheader("📈 Saved Game Predictions")
         st.dataframe(df_preds)
-    except:
+    except Exception:
         st.info("No predictions saved yet.")
