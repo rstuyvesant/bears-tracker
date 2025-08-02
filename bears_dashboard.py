@@ -71,6 +71,100 @@ if uploaded_personnel:
     append_to_excel(df_personnel, "Personnel")
     st.sidebar.success("✅ Personnel data uploaded.")
 
+# ----- Fetch weekly data via nfl_data_py -----
+with st.sidebar.expander("⚡ Fetch Weekly Data (nfl_data_py)"):
+    st.caption("Pulls 2025 weekly team stats for CHI and saves to Excel.")
+    fetch_week = st.number_input(
+        "Week to fetch (2025 season)", min_value=1, max_value=25, value=1, step=1, key="fetch_week_2025"
+    )
+
+    if st.button("Fetch CHI Week via nfl_data_py"):
+        try:
+            import nfl_data_py as nfl
+
+            # Try to refresh local cache (safe if it fails)
+            try:
+                nfl.update.schedule_data([2025])
+            except Exception:
+                pass
+            try:
+                nfl.update.weekly_data([2025])
+            except Exception:
+                pass
+
+            weekly = nfl.import_weekly_data([2025])  # team-level weekly stats
+            wk = int(fetch_week)
+
+            team_week = weekly[(weekly["team"] == "CHI") & (weekly["week"] == wk)].copy()
+
+            if team_week.empty:
+                st.warning("No weekly team row found for CHI in that week. Try again later or verify the week.")
+            else:
+                team_week["Week"] = wk
+
+                # Offense fields (best-effort mapping)
+                pass_yards = team_week.get("passing_yards")
+                pass_yards = pass_yards.values[0] if pass_yards is not None else None
+
+                pass_att = None
+                for cand in ["attempts", "passing_attempts", "pass_attempts"]:
+                    if cand in team_week.columns:
+                        pass_att = team_week[cand].values[0]
+                        break
+
+                try:
+                    ypa_val = float(pass_yards) / float(pass_att) if pass_yards is not None and pass_att not in (None, 0) else None
+                except Exception:
+                    ypa_val = None
+
+                yards_total = None
+                for cand in ["yards", "total_yards", "offense_yards"]:
+                    if cand in team_week.columns:
+                        yards_total = team_week[cand].values[0]
+                        break
+
+                completions = None
+                for cand in ["completions", "passing_completions", "pass_completions"]:
+                    if cand in team_week.columns:
+                        completions = team_week[cand].values[0]
+                        break
+
+                cmp_pct = None
+                if completions is not None and pass_att not in (None, 0):
+                    try:
+                        cmp_pct = round((float(completions) / float(pass_att)) * 100, 1)
+                    except Exception:
+                        cmp_pct = None
+
+                off_row = pd.DataFrame([{
+                    "Week": wk,
+                    "YPA": round(ypa_val, 2) if ypa_val is not None else None,
+                    "YDS": yards_total,
+                    "CMP%": cmp_pct
+                }])
+
+                # Defense (team-level; advanced items need PBP)
+                sacks_val = None
+                for cand in ["sacks", "defense_sacks"]:
+                    if cand in team_week.columns:
+                        sacks_val = team_week[cand].values[0]
+                        break
+
+                def_row = pd.DataFrame([{
+                    "Week": wk,
+                    "SACK": sacks_val,
+                    "RZ% Allowed": None  # requires PBP aggregation
+                }])
+
+                append_to_excel(off_row, "Offense", deduplicate=True)
+                append_to_excel(def_row, "Defense", deduplicate=True)
+                append_to_excel(team_week.rename(columns=str), "Raw_Weekly", deduplicate=False)
+
+                st.success(f"✅ Added CHI week {wk} to Offense/Defense (available fields).")
+                st.caption("Note: Red Zone % Allowed and pressures require play-by-play aggregation; we can add that next.")
+        except Exception as e:
+            st.error(f"Fetch failed: {e}")
+
 # Download Excel
 if os.path.exists(EXCEL_FILE):
     with open(EXCEL_FILE, "rb") as f:
