@@ -368,6 +368,16 @@ if uploaded_personnel:
     st.subheader("Personnel Usage")
     st.dataframe(df_personnel)
 
+# Optional: Show DVOA Proxy Preview if available
+if os.path.exists(EXCEL_FILE):
+    try:
+        df_dvoa = pd.read_excel(EXCEL_FILE, sheet_name="DVOA_Proxy")
+        if not df_dvoa.empty:
+            st.subheader("📊 DVOA-Like Proxy Metrics")
+            st.dataframe(df_dvoa.tail(5))  # Show last 5 weeks
+    except:
+        st.info("No DVOA Proxy data available yet.")
+
 # Media Summary Section
 st.markdown("### 📰 Weekly Beat Writer / ESPN Summary")
 with st.form("media_form"):
