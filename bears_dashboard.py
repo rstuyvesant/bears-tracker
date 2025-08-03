@@ -229,7 +229,118 @@ if st.sidebar.button("Fetch Play-by-Play Metrics"):
             st.caption("Note: Hurries aren’t separately flagged in standard PBP; pressures = sacks + QB hits.")
     except Exception as e:
         st.error(f"❌ Failed to fetch metrics: {e}")
+# ----- DVOA-like proxy via opponent-adjusted EPA & Success Rate (PBP) -----
+st.sidebar.markdown("### 📈 Compute DVOA-like Proxy (Opponent-Adjusted)")
+proxy_week = st.sidebar.number_input("Week to Compute (2025 Season)", min_value=1, max_value=25, value=1, step=1, key="proxy_week_2025")
 
+def _success_flag(down, ydstogo, yards_gained):
+    try:
+        if pd.isna(down) or pd.isna(ydstogo) or pd.isna(yards_gained):
+            return False
+        d = int(down); togo = float(ydstogo); gain = float(yards_gained)
+        if d == 1:
+            return gain >= 0.4 * togo
+        elif d == 2:
+            return gain >= 0.6 * togo
+        else:
+            return gain >= togo
+    except Exception:
+        return False
+
+if st.sidebar.button("Compute DVOA-like Proxy"):
+    try:
+        import nfl_data_py as nfl
+
+        wk = int(proxy_week)
+        pbp = nfl.import_pbp_data([2025], downcast=False)
+
+        # Keep real plays with EPA defined
+        plays = pbp[
+            (~pbp["play_type"].isin(["no_play"])) &
+            (~pbp["penalty"].fillna(False)) &
+            (~pbp["epa"].isna())
+        ].copy()
+
+        # Identify Bears game that week
+        bears_off = plays[(plays["week"] == wk) & (plays["posteam"] == "CHI")].copy()
+        bears_def = plays[(plays["week"] == wk) & (plays["defteam"] == "CHI")].copy()
+
+        if bears_off.empty and bears_def.empty:
+            st.warning("No CHI plays found for that week yet. Try again later.")
+        else:
+            # Opponent detection (should be one for the week)
+            opps = set()
+            if not bears_off.empty:
+                opps.update(bears_off["defteam"].unique().tolist())
+            if not bears_def.empty:
+                opps.update(bears_def["posteam"].unique().tolist())
+            opponent = list(opps)[0] if opps else "UNK"
+
+            # Season-to-date (prior to this week) opponent benchmarks
+            prior = plays[plays["week"] < wk].copy()
+
+            # Opponent defensive benchmarks (allowed vs them)
+            opp_def_plays = prior[prior["defteam"] == opponent].copy()
+            opp_def_epa = opp_def_plays["epa"].mean() if len(opp_def_plays) else None
+            if len(opp_def_plays):
+                opp_def_success = opp_def_plays.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                opp_def_success = None
+
+            # Opponent offensive benchmarks (their offense)
+            opp_off_plays = prior[prior["posteam"] == opponent].copy()
+            opp_off_epa = opp_off_plays["epa"].mean() if len(opp_off_plays) else None
+            if len(opp_off_plays):
+                opp_off_success = opp_off_plays.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                opp_off_success = None
+
+            # Bears week EPA/SR on offense & defense
+            if len(bears_off):
+                chi_off_epa = bears_off["epa"].mean()
+                chi_off_success = bears_off.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                chi_off_epa = None; chi_off_success = None
+
+            if len(bears_def):
+                chi_def_epa_allowed = bears_def["epa"].mean()
+                chi_def_success_allowed = bears_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                chi_def_epa_allowed = None; chi_def_success_allowed = None
+
+            # Opponent adjustments (differences). For success rates, scale to %.
+            def safe_diff(a, b):
+                if a is None or pd.isna(a) or b is None or pd.isna(b):
+                    return None
+                return float(a) - float(b)
+
+            off_adj_epa = safe_diff(chi_off_epa, opp_def_epa)
+            off_adj_sr  = safe_diff(chi_off_success, opp_def_success)
+            def_adj_epa = safe_diff(chi_def_epa_allowed, opp_off_epa)
+            def_adj_sr  = safe_diff(chi_def_success_allowed, opp_off_success)
+
+            # Build output row (percentages to 1 decimal)
+            out = pd.DataFrame([{
+                "Week": wk,
+                "Opponent": opponent,
+                "Off Adj EPA/play": round(off_adj_epa, 3) if off_adj_epa is not None else None,
+                "Off Adj SR%": round(off_adj_sr * 100, 1) if off_adj_sr is not None else None,
+                "Def Adj EPA/play": round(def_adj_epa, 3) if def_adj_epa is not None else None,
+                "Def Adj SR%": round(def_adj_sr * 100, 1) if def_adj_sr is not None else None,
+                # raw references (optional, helpful for debugging)
+                "Off EPA/play": round(chi_off_epa, 3) if chi_off_epa is not None else None,
+                "Def EPA allowed/play": round(chi_def_epa_allowed, 3) if chi_def_epa_allowed is not None else None
+            }])
+
+            append_to_excel(out, "DVOA_Proxy", deduplicate=True)
+            st.success(
+                f"✅ DVOA-like proxy saved for Week {wk} vs {opponent} "
+                f"(Off Adj EPA/play={out.iloc[0]['Off Adj EPA/play']}, Off Adj SR%={out.iloc[0]['Off Adj SR%']}, "
+                f"Def Adj EPA/play={out.iloc[0]['Def Adj EPA/play']}, Def Adj SR%={out.iloc[0]['Def Adj SR%']})"
+            )
+
+    except Exception as e:
+        st.error(f"❌ Failed to compute proxy: {e}")
 # Download Excel
 if os.path.exists(EXCEL_FILE):
     with open(EXCEL_FILE, "rb") as f:
