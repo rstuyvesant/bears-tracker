@@ -180,7 +180,6 @@ if os.path.exists(EXCEL_FILE):
         st.dataframe(df_media)
     except:
         st.info("No media summaries found.")
-
 # Prediction Section
 st.markdown("### 🔮 Weekly Game Prediction")
 week_to_predict = st.number_input("Select Week to Predict", min_value=1, max_value=25, step=1, key="predict_week_input")
@@ -204,18 +203,43 @@ if os.path.exists(EXCEL_FILE):
             except:
                 ypa = red_zone_allowed = sacks = 0
 
-            if "blitz" in strategy_text and sacks >= 3:
+            try:
+                df_dvoa = pd.read_excel(EXCEL_FILE, sheet_name="DVOA_Proxy")
+                dvoa_row = df_dvoa[df_dvoa["Week"] == week_to_predict]
+                if not dvoa_row.empty:
+                    off_adj_epa = float(dvoa_row.iloc[0].get("Off_EPA_Adj", 0))
+                    def_adj_epa = float(dvoa_row.iloc[0].get("Def_EPA_Adj", 0))
+                else:
+                    off_adj_epa = def_adj_epa = None
+            except:
+                off_adj_epa = def_adj_epa = None
+
+            # --- Rule set (ordered) ---
+            reason_bits = []
+
+            if (off_adj_epa is not None and off_adj_epa >= 0.15) and (def_adj_epa is not None and def_adj_epa <= -0.05):
+                prediction = "Win – efficiency edge on both sides"
+                reason_bits.append(f"Off+{off_adj_epa:+.2f} EPA/play vs opp D")
+                reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play vs opp O")
+            elif "blitz" in strategy_text and sacks >= 3:
                 prediction = "Win – pressure defense likely disrupts opponent"
+                reason_bits.append("Blitz strategy and ≥3 sacks")
             elif ypa < 6 and red_zone_allowed > 65:
                 prediction = "Loss – inefficient passing and weak red zone defense"
+                reason_bits.append(f"YPA={ypa}, RZ Allowed={red_zone_allowed}%")
             elif "zone" in strategy_text and red_zone_allowed < 50:
                 prediction = "Win – disciplined zone and red zone efficiency"
+                reason_bits.append("Zone coverage and red zone strength")
             elif any(word in strategy_text for word in ["struggled", "injuries", "turnovers"]):
                 prediction = "Loss – opponent issues likely to affect performance"
+                reason_bits.append("Opponent struggles or injury mentions")
             else:
                 prediction = "Loss – no clear advantage in key strategy or stats"
+                reason_bits.append("No edge in strategy, EPA, or red zone metrics")
 
+            full_reason = "; ".join(reason_bits)
             st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
+            st.markdown(f"**Reason:** {full_reason}")
 
             prediction_entry = pd.DataFrame([{
                 "Week": week_to_predict,
@@ -226,7 +250,7 @@ if os.path.exists(EXCEL_FILE):
         else:
             st.info("Missing data for that week.")
     except Exception as e:
-        st.warning("Prediction failed. Check uploaded data.")
+        st.warning(f"Prediction failed. Check uploaded data. Error: {e}")
 
 # Show saved predictions
 if os.path.exists(EXCEL_FILE):
@@ -235,70 +259,4 @@ if os.path.exists(EXCEL_FILE):
         st.subheader("📈 Saved Game Predictions")
         st.dataframe(df_preds)
     except:
-        st.info("No predictions saved yet.")
-                prediction = "Win – efficiency edge on both sides"
-                reason_bits.append(f"Off+{off_adj_epa:+.2f} EPA/play vs opp D")
-                reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play vs opp O")
-
-            # Pass-rush advantage
-            elif (pressures is not None and pressures >= 8) and ("blitz" in strategy_text or "pressure" in strategy_text):
-                prediction = "Win – pass rush advantage"
-                reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None:
-                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            # Coverage + red zone discipline
-            elif (rz_allowed is not None and rz_allowed < 50) and any(tok in strategy_text for tok in ["zone", "two-high", "split-safety"]):
-                prediction = "Win – red zone + coverage advantage"
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            # Clear offensive/defensive drag
-            elif (off_adj_epa is not None and off_adj_epa <= -0.10) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss – inefficient offense and poor red zone defense"
-                reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            # Legacy fallback using YPA + RZ
-            elif (ypa is not None and ypa < 6) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss – inefficient passing and weak red zone defense"
-                reason_bits.append(f"YPA={ypa:.1f}")
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            else:
-                prediction = "Loss – no clear advantage in key strategy or stats"
-                if off_adj_epa is not None:
-                    reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
-                if def_adj_epa is not None:
-                    reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play")
-                if pressures is not None:
-                    reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None:
-                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            reason_text = " | ".join(reason_bits)
-            st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
-            if reason_text:
-                st.caption(reason_text)
-
-            # Save prediction to Excel
-            prediction_entry = pd.DataFrame([{
-                "Week": week_to_predict,
-                "Prediction": prediction.split("–")[0].strip(),
-                "Reason": prediction.split("–")[1].strip() if "–" in prediction else "",
-                "Notes": reason_text
-            }])
-            append_to_excel(prediction_entry, "Predictions", deduplicate=True)
-
-        else:
-            st.info("Please upload or fetch Strategy, Offense, and Defense data for this week first.")
-    except Exception as e:
-        st.warning(f"Prediction failed. Check uploaded/fetched data. Error: {e}")
-
-# Show saved predictions
-if os.path.exists(EXCEL_FILE):
-    try:
-        df_preds = pd.read_excel(EXCEL_FILE, sheet_name="Predictions")
-        st.subheader("📈 Saved Game Predictions")
-        st.dataframe(df_preds)
-    except Exception:
         st.info("No predictions saved yet.")
