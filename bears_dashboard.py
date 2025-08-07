@@ -50,9 +50,17 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
 # Sidebar upload
 st.sidebar.header("📤 Upload New Weekly Data")
 uploaded_offense = st.sidebar.file_uploader("Upload Offensive Analytics (.csv)", type="csv")
+if uploaded_offense:
+    st.write("📤 Offensive CSV Uploaded:", uploaded_offense.name)
 uploaded_defense = st.sidebar.file_uploader("Upload Defensive Analytics (.csv)", type="csv")
+if uploaded_defense:
+    st.write("📤 Defensive CSV Uploaded:", uploaded_defense.name)
 uploaded_strategy = st.sidebar.file_uploader("Upload Weekly Strategy (.csv)", type="csv")
+if uploaded_strategy:
+    st.write("📤 Strategy CSV Uploaded:", uploaded_strategy.name)
 uploaded_personnel = st.sidebar.file_uploader("Upload Personnel Usage (.csv)", type="csv")
+if uploaded_personnel:
+    st.write("📤 Personnel CSV Uploaded:", uploaded_personnel.name)
 
 if uploaded_offense:
     df_offense = pd.read_csv(uploaded_offense)
