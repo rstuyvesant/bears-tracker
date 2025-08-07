@@ -10,6 +10,10 @@ st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
 st.markdown("Track weekly stats, strategy, personnel usage, and league comparisons.")
 
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
+# 🔍 Debug: Show current working directory and target Excel file
+import os
+st.write("📁 Current Working Directory:", os.getcwd())
+st.write("📄 Excel File Being Used:", EXCEL_FILE)
 
 # Append new data to Excel workbook
 def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True):
