@@ -10,6 +10,35 @@ st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
 st.markdown("Track weekly stats, strategy, personnel usage, and league comparisons.")
 
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
+# Ensure required sheets exist in Excel
+def initialize_excel_sheets():
+    import openpyxl
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    empty_sheets = {
+        "DVOA_Proxy": pd.DataFrame(columns=["Week", "DVOA_Proxy", "YPA", "CMP%", "RZ% Allowed", "SACK"]),
+        "Predictions": pd.DataFrame(columns=["Week", "Prediction", "Reason"])
+    }
+
+    if os.path.exists(EXCEL_FILE):
+        book = openpyxl.load_workbook(EXCEL_FILE)
+    else:
+        book = openpyxl.Workbook()
+        book.remove(book.active)  # remove default sheet
+
+    modified = False
+    for sheet_name, df in empty_sheets.items():
+        if sheet_name not in book.sheetnames:
+            sheet = book.create_sheet(sheet_name)
+            for r in dataframe_to_rows(df, index=False, header=True):
+                sheet.append(r)
+            modified = True
+
+    if modified:
+        book.save(EXCEL_FILE)
+
+# Run initialization
+initialize_excel_sheets()
 # 🔍 Debug: Show current working directory and target Excel file
 import os
 st.write("📁 Current Working Directory:", os.getcwd())
