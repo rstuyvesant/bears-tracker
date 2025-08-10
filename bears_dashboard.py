@@ -46,6 +46,10 @@ st.write("📄 Excel File Being Used:", EXCEL_FILE)
 
 # Append new data to Excel workbook
 def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True):
+   def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True):
+    import openpyxl
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
     try:
         if os.path.exists(file_name):
             book = openpyxl.load_workbook(file_name)
@@ -55,8 +59,11 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
                 existing_data.columns = existing_data.iloc[0]
                 existing_data = existing_data[1:]
 
+                # ✅ Improved deduplication logic
                 if deduplicate and "Week" in existing_data.columns and "Week" in new_data.columns:
-                    existing_data = existing_data[existing_data["Week"] != str(new_data.iloc[0]["Week"])]
+                    new_weeks = new_data["Week"].astype(str).unique()
+                    existing_data = existing_data[~existing_data["Week"].astype(str).isin(new_weeks)]
+
                 combined_data = pd.concat([existing_data, new_data], ignore_index=True)
             else:
                 combined_data = new_data
@@ -65,6 +72,7 @@ def append_to_excel(new_data, sheet_name, file_name=EXCEL_FILE, deduplicate=True
             book.remove(book.active)
             combined_data = new_data
 
+        # Recreate the sheet
         if sheet_name in book.sheetnames:
             del book[sheet_name]
         sheet = book.create_sheet(sheet_name)
