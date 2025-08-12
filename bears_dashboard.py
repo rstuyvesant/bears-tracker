@@ -110,6 +110,116 @@ if uploaded_personnel:
     df_personnel = pd.read_csv(uploaded_personnel)
     append_to_excel(df_personnel, "Personnel")
     st.sidebar.success("✅ Personnel data uploaded.")
+# ===== Excel Sanity Checker (Workbook Inspector & Repair) =====
+with st.sidebar.expander("🔍 Excel Sanity Checker"):
+    # 1) Which file is the app using?
+    abs_path = os.path.abspath(EXCEL_FILE)
+    st.write("Excel file path:", abs_path)
+    exists = os.path.exists(EXCEL_FILE)
+    st.write("Exists:", exists)
+
+    # 2) If it exists, basic info + sheet list + quick previews
+    sheet_names = []
+    if exists:
+        try:
+            st.write("Size (bytes):", os.path.getsize(EXCEL_FILE))
+        except Exception as e:
+            st.warning(f"Could not read file size: {e}")
+
+        try:
+            xls = pd.ExcelFile(EXCEL_FILE)
+            sheet_names = xls.sheet_names
+            st.write("Sheets:", sheet_names)
+            # Quick preview each sheet (first 5 rows)
+            for name in sheet_names:
+                try:
+                    df_preview = pd.read_excel(EXCEL_FILE, sheet_name=name)
+                    st.write(f"Preview — **{name}**")
+                    st.dataframe(df_preview.head(5))
+                except Exception as e:
+                    st.warning(f"Can't open sheet '{name}': {e}")
+        except Exception as e:
+            st.error(f"Failed to inspect workbook: {e}")
+
+    # 3) Validate required sheets & columns
+    REQUIRED = {
+        "Offense":     ["Week", "YPA", "YDS", "CMP%"],
+        "Defense":     ["Week", "SACK", "RZ% Allowed"],
+        "Strategy":    ["Week"],            # you can add more strategy cols later
+        "Personnel":   ["Week"],            # add more personnel cols as needed
+        "DVOA_Proxy":  ["Week", "DVOA_Proxy"],
+        "Predictions": ["Week", "Prediction"]
+    }
+
+    if exists and sheet_names:
+        issues = []
+        for sheet, cols in REQUIRED.items():
+            if sheet not in sheet_names:
+                issues.append(f"Missing sheet: **{sheet}**")
+            else:
+                try:
+                    df_chk = pd.read_excel(EXCEL_FILE, sheet_name=sheet)
+                    missing_cols = [c for c in cols if c not in df_chk.columns]
+                    if missing_cols:
+                        issues.append(f"{sheet}: missing columns {missing_cols}")
+                except Exception as e:
+                    issues.append(f"{sheet}: failed to read ({e})")
+
+        if issues:
+            st.error("Problems found:")
+            for i in issues:
+                st.markdown(f"- {i}")
+        else:
+            st.success("Workbook structure looks good ✅")
+
+        # 4) Duplicate Week guardrail (helpful for your dedup debugging)
+        try:
+            for s in ["Offense", "Defense", "Predictions", "DVOA_Proxy"]:
+                if s in sheet_names:
+                    df_dup = pd.read_excel(EXCEL_FILE, sheet_name=s)
+                    if "Week" in df_dup.columns and not df_dup.empty:
+                        dup_mask = df_dup["Week"].astype(str).duplicated(keep=False)
+                        if dup_mask.any():
+                            dups = sorted(df_dup.loc[dup_mask, "Week"].astype(str).unique())
+                            st.warning(f"Duplicate **Week** values in **{s}**: {dups}")
+        except Exception as e:
+            st.warning(f"Duplicate check skipped: {e}")
+
+    # 5) One-click create/repair workbook (makes empty sheets with headers)
+    if st.button("🛠 Create/Repair workbook"):
+        try:
+            import openpyxl
+            from openpyxl import Workbook
+
+            if not os.path.exists(EXCEL_FILE):
+                wb = Workbook()
+                wb.remove(wb.active)  # remove the default blank sheet
+            else:
+                wb = openpyxl.load_workbook(EXCEL_FILE)
+
+            def ensure_sheet(wb_obj, name, cols):
+                if name in wb_obj.sheetnames:
+                    ws = wb_obj[name]
+                    # If header missing or corrupt, rewrite header row
+                    try:
+                        first_row = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+                    except StopIteration:
+                        first_row = []
+                    if not first_row or any(c not in first_row for c in cols):
+                        # wipe and write header
+                        ws.delete_rows(1, ws.max_row)
+                        ws.append(cols)
+                else:
+                    ws = wb_obj.create_sheet(name)
+                    ws.append(cols)
+
+            for sheet, cols in REQUIRED.items():
+                ensure_sheet(wb, sheet, cols)
+
+            wb.save(EXCEL_FILE)
+            st.success("Workbook created/repaired. Refresh this expander to re-check ✅")
+        except Exception as e:
+            st.error(f"Could not create/repair workbook: {e}")
 
 # ----- DVOA Proxy Computation -----
 st.markdown("### 📊 Compute DVOA-like Proxy")
