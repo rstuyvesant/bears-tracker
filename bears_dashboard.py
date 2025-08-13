@@ -118,6 +118,115 @@ if uploaded_personnel:
     append_to_excel(df_personnel, "Personnel")
     st.sidebar.success("✅ Personnel data uploaded.")
 
+# ----- ➕ Create Automatic Next Week Row (template) -----
+st.markdown("### ➕ Create Next Week Template Row")
+
+def _sheet_exists(xfile: str, name: str) -> bool:
+    try:
+        xls = pd.ExcelFile(xfile)
+        return name in xls.sheet_names
+    except Exception:
+        return False
+
+def _read_sheet_safe(xfile: str, sheet: str) -> pd.DataFrame:
+    try:
+        return pd.read_excel(xfile, sheet_name=sheet)
+    except Exception:
+        return pd.DataFrame()
+
+def _max_week_from(df: pd.DataFrame) -> int:
+    if "Week" in df.columns and not df.empty:
+        try:
+            return int(pd.to_numeric(df["Week"], errors="coerce").dropna().max())
+        except Exception:
+            return 0
+    return 0
+
+def _get_next_week(xfile: str) -> int:
+    # Look across all main sheets and choose the highest week + 1
+    candidates = []
+    for nm in ["Offense", "Defense", "Strategy", "Personnel"]:
+        df = _read_sheet_safe(xfile, nm)
+        candidates.append(_max_week_from(df))
+    top = max(candidates) if candidates else 0
+    nxt = (top + 1) if top >= 1 else 1  # start at 1 if workbook is empty
+    return int(nxt)
+
+# Compute suggested next week from workbook
+suggested_next = _get_next_week(EXCEL_FILE) if os.path.exists(EXCEL_FILE) else 1
+next_week = st.number_input("Next week to add", min_value=1, max_value=25, value=suggested_next, step=1, key="next_week_template")
+
+# Define default column layouts if a sheet doesn't exist yet
+DEFAULT_COLS = {
+    "Offense":   ["Week", "Opponent", "YDS", "YPA", "YPC", "CMP%", "QBR", "DVOA", "SR%",
+                  "DIV Avg YDS", "DIV Avg QBR", "DIV Avg SR%", "CONF Avg YDS", "CONF Avg QBR",
+                  "CONF Avg SR%", "NFL Avg YDS", "NFL Avg QBR", "NFL Avg SR%"],
+    "Defense":   ["Week", "SACK", "INT", "FF", "FR", "DVOA", "3D% Allowed", "RZ% Allowed", "QB Hits", "Pressures"],
+    "Strategy":  ["Week", "Opponent", "Off_Strategy", "Off_Result", "Def_Strategy", "Def_Result",
+                  "Key Notes", "Next_Week Impact"],
+    "Personnel": ["Week", "11 Personnel", "12 Personnel", "13 Personnel", "21 Personnel",
+                  "Division 11", "Division 12", "Division 13", "Division 21",
+                  "Conf 11", "Conf 12", "Conf 13", "Conf 21",
+                  "NFL 11", "NFL 12", "NFL 13", "NFL 21"]
+}
+
+def _empty_row_for(sheet_name: str, week_val: int) -> pd.DataFrame:
+    # If sheet exists, mirror its columns; else use defaults
+    if os.path.exists(EXCEL_FILE) and _sheet_exists(EXCEL_FILE, sheet_name):
+        cols_df = _read_sheet_safe(EXCEL_FILE, sheet_name)
+        cols = list(cols_df.columns)
+        if "Week" not in cols:
+            cols = ["Week"] + cols  # ensure Week is present
+    else:
+        cols = DEFAULT_COLS.get(sheet_name, ["Week"])
+    row = {c: (week_val if c == "Week" else None) for c in cols}
+    return pd.DataFrame([row])
+
+col1, col2 = st.columns([1,1])
+with col1:
+    if st.button("➕ Add Next Week Template Rows"):
+        try:
+            # Create/append a blank row for each key sheet
+            for sheet in ["Offense", "Defense", "Strategy", "Personnel"]:
+                df_new = _empty_row_for(sheet, int(next_week))
+                append_to_excel(df_new, sheet, deduplicate=True)
+            st.success(f"✅ Created template rows for Week {int(next_week)} in Offense, Defense, Strategy, and Personnel.")
+        except Exception as e:
+            st.error(f"❌ Could not create templates: {e}")
+
+with col2:
+    if st.button("🧹 Remove Empty Template Rows for This Week"):
+        try:
+            # Remove rows for this week that are entirely empty (except Week)
+            for sheet in ["Offense", "Defense", "Strategy", "Personnel"]:
+                df = _read_sheet_safe(EXCEL_FILE, sheet)
+                if df.empty or "Week" not in df.columns:
+                    continue
+                wk_mask = pd.to_numeric(df["Week"], errors="coerce") == int(next_week)
+                # define "empty row" as all columns except Week are null/empty/""
+                non_week_cols = [c for c in df.columns if c != "Week"]
+                if not non_week_cols:
+                    continue
+
+                def _is_blank_row(r):
+                    return all((pd.isna(r[c]) or (isinstance(r[c], str) and r[c].strip() == "")) for c in non_week_cols)
+
+                keep_rows = []
+                for i, r in df.iterrows():
+                    if wk_mask.iloc[i] and _is_blank_row(r):
+                        # drop this one (skip adding)
+                        continue
+                    keep_rows.append(r)
+                if keep_rows:
+                    cleaned = pd.DataFrame(keep_rows, columns=df.columns)
+                else:
+                    cleaned = pd.DataFrame(columns=df.columns)
+
+                append_to_excel(cleaned, sheet, deduplicate=False)  # overwrite via append_to_excel logic
+            st.success(f"🧽 Removed empty template rows for Week {int(next_week)} where applicable.")
+        except Exception as e:
+            st.error(f"❌ Cleanup failed: {e}")
+# ----- END: Create Automatic Next Week Row (template) -----
 # --------------------------
 # Download whole Excel
 # --------------------------
