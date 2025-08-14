@@ -437,9 +437,11 @@ if submit_media:
     append_to_excel(media_df, "Media_Summaries", deduplicate=False)
     st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
 
-# ------------------ Weekly Prediction ------------------
+# ------------------ # Prediction Section (button + smarter opponent detection)
 st.markdown("### 🔮 Weekly Game Prediction")
-week_to_predict = st.number_input("Select Week to Predict", min_value=1, max_value=25, step=1, key="predict_week_input")
+week_to_predict = st.number_input(
+    "Select Week to Predict", min_value=1, max_value=25, step=1, key="predict_week_input"
+)
 
 def _safe_float(x, default=None):
     try:
@@ -449,92 +451,140 @@ def _safe_float(x, default=None):
     except Exception:
         return default
 
-if os.path.exists(EXCEL_FILE):
+def _get_opponent_from_strategy(row_s):
+    # If your Strategy CSV has an Opponent column, use it
     try:
-        df_strategy = _read_sheet("Strategy")
-        df_offense  = _read_sheet("Offense")
-        df_defense  = _read_sheet("Defense")
-        df_advdef   = _read_sheet("Advanced_Defense")
-        df_proxy    = _read_sheet("DVOA_Proxy")
+        opp = str(row_s.iloc[0].get("Opponent", "")).strip()
+        return opp if opp else None
+    except Exception:
+        return None
 
-        row_s = df_strategy[df_strategy.get("Week", pd.Series([])) == week_to_predict] if not df_strategy.empty else pd.DataFrame()
-        row_o = df_offense[df_offense.get("Week", pd.Series([])) == week_to_predict] if not df_offense.empty else pd.DataFrame()
-        row_d = df_defense[df_defense.get("Week", pd.Series([])) == week_to_predict] if not df_defense.empty else pd.DataFrame()
-        row_a = df_advdef[df_advdef.get("Week", pd.Series([])) == week_to_predict] if not df_advdef.empty else pd.DataFrame()
-        row_p = df_proxy[df_proxy.get("Week", pd.Series([])) == week_to_predict] if not df_proxy.empty else pd.DataFrame()
-
-        if not row_s.empty and not row_o.empty and not row_d.empty:
-            strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
-
-            ypa = _safe_float(row_o.iloc[0].get("YPA"), default=None)
-
-            rz_allowed = None
-            pressures = None
-            if not row_a.empty:
-                rz_allowed = _safe_float(row_a.iloc[0].get("RZ% Allowed"), default=None)
-                pressures  = _safe_float(row_a.iloc[0].get("Pressures"), default=None)
-            if rz_allowed is None:
-                rz_allowed = _safe_float(row_d.iloc[0].get("RZ% Allowed"), default=None)
-
-            off_adj_epa = off_adj_sr = def_adj_epa = def_adj_sr = None
-            if not row_p.empty:
-                off_adj_epa = _safe_float(row_p.iloc[0].get("Off Adj EPA/play"), default=None)
-                off_adj_sr  = _safe_float(row_p.iloc[0].get("Off Adj SR%"), default=None)
-                def_adj_epa = _safe_float(row_p.iloc[0].get("Def Adj EPA/play"), default=None)
-                def_adj_sr  = _safe_float(row_p.iloc[0].get("Def Adj SR%"), default=None)
-
-            reason_bits = []
-            # Efficiency edge
-            if (off_adj_epa is not None and off_adj_epa >= 0.15) and (def_adj_epa is not None and def_adj_epa <= -0.05):
-                prediction = "Win - efficiency edge on both sides"
-                reason_bits.append(f"Off {off_adj_epa:+.2f} EPA/play vs opp D")
-                reason_bits.append(f"Def {def_adj_epa:+.2f} EPA/play vs opp O")
-            # Pass-rush advantage
-            elif (pressures is not None and pressures >= 8) and ("blitz" in strategy_text or "pressure" in strategy_text):
-                prediction = "Win - pass rush advantage"
-                reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None:
-                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-            # Coverage + red zone discipline
-            elif (rz_allowed is not None and rz_allowed < 50) and any(tok in strategy_text for tok in ["zone", "two-high", "split-safety"]):
-                prediction = "Win - red zone + coverage advantage"
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-            # Clear drag
-            elif (off_adj_epa is not None and off_adj_epa <= -0.10) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss - inefficient offense and poor red zone defense"
-                reason_bits.append(f"Off {off_adj_epa:+.2f} EPA/play")
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-            # Legacy fallback
-            elif (ypa is not None and ypa < 6) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss - inefficient passing and weak red zone defense"
-                reason_bits.append(f"YPA={ypa:.1f}")
-                reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-            else:
-                prediction = "Loss - no clear advantage in key strategy or stats"
-                if off_adj_epa is not None:
-                    reason_bits.append(f"Off {off_adj_epa:+.2f} EPA/play")
-                if def_adj_epa is not None:
-                    reason_bits.append(f"Def {def_adj_epa:+.2f} EPA/play")
-                if pressures is not None:
-                    reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None:
-                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-
-            reason_text = " | ".join(reason_bits)
-            st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
-            if reason_text:
-                st.caption(reason_text)
-
-            # Save
-            prediction_entry = pd.DataFrame([{
-                "Week": week_to_predict,
-                "Prediction": prediction.split("-")[0].strip(),
-                "Reason": prediction.split("-")[1].strip() if "-" in prediction else "",
-                "Notes": reason_text
-            }])
-            append_to_excel(prediction_entry, "Predictions", deduplicate=True)
+def _get_opponent_from_schedule(week_num):
+    # Fallback: ask nfl_data_py for the schedule and infer opponent
+    try:
+        import nfl_data_py as nfl
+        sched = nfl.import_schedules([2025])
+        chi_row = sched[(sched["week"] == int(week_num)) &
+                        ((sched["home_team"] == "CHI") | (sched["away_team"] == "CHI"))]
+        if chi_row.empty:
+            return None
+        r = chi_row.iloc[0]
+        if r["home_team"] == "CHI":
+            return str(r["away_team"])
         else:
-            st.info("Please upload or fetch Strategy, Offense, and Defense data for this week first.")
+            return str(r["home_team"])
+    except Exception:
+        return None
+
+def run_prediction_for_week(wk):
+    # Load required/optional sheets
+    df_strategy = pd.read_excel(EXCEL_FILE, sheet_name="Strategy")
+    df_offense  = pd.read_excel(EXCEL_FILE, sheet_name="Offense")
+    df_defense  = pd.read_excel(EXCEL_FILE, sheet_name="Defense")
+
+    # Optional advanced sheets
+    try:
+        df_advdef = pd.read_excel(EXCEL_FILE, sheet_name="Advanced_Defense")
+    except Exception:
+        df_advdef = pd.DataFrame()
+
+    try:
+        df_proxy = pd.read_excel(EXCEL_FILE, sheet_name="DVOA_Proxy")
+    except Exception:
+        df_proxy = pd.DataFrame()
+
+    # Filter week rows
+    row_s = df_strategy[df_strategy["Week"] == wk]
+    row_o = df_offense[df_offense["Week"] == wk]
+    row_d = df_defense[df_defense["Week"] == wk]
+    row_a = df_advdef[df_advdef["Week"] == wk] if not df_advdef.empty else pd.DataFrame()
+    row_p = df_proxy[df_proxy["Week"] == wk] if not df_proxy.empty else pd.DataFrame()
+
+    if row_s.empty or row_o.empty or row_d.empty:
+        raise ValueError("Missing Strategy, Offense, or Defense row for that week.")
+
+    # Opponent: Strategy first, then schedule fallback
+    opponent = _get_opponent_from_strategy(row_s)
+    if not opponent:
+        opponent = _get_opponent_from_schedule(wk) or "Unknown"
+
+    # Strategy text
+    strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
+
+    # Offense basics
+    ypa = _safe_float(row_o.iloc[0].get("YPA"), default=None)
+
+    # Prefer Advanced_Defense RZ% & Pressures when present
+    rz_allowed = None
+    pressures = None
+    if not row_a.empty:
+        rz_allowed = _safe_float(row_a.iloc[0].get("RZ% Allowed"), default=None)
+        pressures  = _safe_float(row_a.iloc[0].get("Pressures"), default=None)
+    if rz_allowed is None:
+        rz_allowed = _safe_float(row_d.iloc[0].get("RZ% Allowed"), default=None)
+
+    # DVOA-like proxy (opponent-adjusted EPA/SR) if available
+    off_adj_epa = off_adj_sr = def_adj_epa = def_adj_sr = None
+    if not row_p.empty:
+        off_adj_epa = _safe_float(row_p.iloc[0].get("Off Adj EPA/play"), default=None)
+        off_adj_sr  = _safe_float(row_p.iloc[0].get("Off Adj SR%"), default=None)
+        def_adj_epa = _safe_float(row_p.iloc[0].get("Def Adj EPA/play"), default=None)
+        def_adj_sr  = _safe_float(row_p.iloc[0].get("Def Adj SR%"), default=None)
+
+    # Rule set (ordered)
+    reason_bits = []
+    if (off_adj_epa is not None and off_adj_epa >= 0.15) and (def_adj_epa is not None and def_adj_epa <= -0.05):
+        prediction = "Win – efficiency edge on both sides"
+        reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play vs opp D")
+        reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play vs opp O")
+    elif (pressures is not None and pressures >= 8) and ("blitz" in strategy_text or "pressure" in strategy_text):
+        prediction = "Win – pass rush advantage"
+        reason_bits.append(f"Pressures={int(pressures)}")
+        if rz_allowed is not None:
+            reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+    elif (rz_allowed is not None and rz_allowed < 50) and any(tok in strategy_text for tok in ["zone", "two-high", "split-safety"]):
+        prediction = "Win – red zone + coverage advantage"
+        reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+    elif (off_adj_epa is not None and off_adj_epa <= -0.10) and (rz_allowed is not None and rz_allowed > 65):
+        prediction = "Loss – inefficient offense and poor red zone defense"
+        reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
+        reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+    elif (ypa is not None and ypa < 6) and (rz_allowed is not None and rz_allowed > 65):
+        prediction = "Loss – inefficient passing and weak red zone defense"
+        reason_bits.append(f"YPA={ypa:.1f}")
+        reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+    else:
+        prediction = "Loss – no clear advantage in key strategy or stats"
+        if off_adj_epa is not None:
+            reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
+        if def_adj_epa is not None:
+            reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play")
+        if pressures is not None:
+            reason_bits.append(f"Pressures={int(pressures)}")
+        if rz_allowed is not None:
+            reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+
+    reason_text = " | ".join(reason_bits)
+
+    # Save prediction
+    prediction_entry = pd.DataFrame([{
+        "Week": wk,
+        "Opponent": opponent,
+        "Prediction": prediction.split("–")[0].strip(),
+        "Reason": prediction.split("–")[1].strip() if "–" in prediction else "",
+        "Notes": reason_text
+    }])
+    append_to_excel(prediction_entry, "Predictions", deduplicate=True)
+
+    return opponent, prediction, reason_text
+
+# Button to run prediction explicitly
+if st.button("Run Prediction"):
+    try:
+        opp, pred, notes = run_prediction_for_week(week_to_predict)
+        st.success(f"**Predicted Outcome for Week {week_to_predict} vs {opp}: {pred}**")
+        if notes:
+            st.caption(notes)
     except Exception as e:
         st.warning(f"Prediction failed. Check uploaded/fetched data. Error: {e}")
 
