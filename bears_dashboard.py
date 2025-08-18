@@ -1,464 +1,479 @@
+import os
 import streamlit as st
 import pandas as pd
-import os
+from fpdf import FPDF
 
-st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
+# ----------------------------
+# App header
+# ----------------------------
+st.set_page_config(page_title="Chicago Bears 2025-26 Weekly Tracker", layout="wide")
 st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
-st.markdown("Track weekly stats, strategy, personnel usage, injuries, and league comparisons.")
+st.markdown("Track weekly stats, strategy, personnel usage, league comparisons, and advanced metrics.")
 
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
 TEAM = "CHI"
 SEASON = 2025
-MAX_WEEKS = 25  # pre/post included safety
 
-# =============================
+# ----------------------------
 # Helpers
-# =============================
-
-def _safe_float(x, default=None):
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-def _dedup_by_week(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the last row per Week if 'Week' exists; otherwise drop exact duplicates."""
-    if "Week" in df.columns:
-        # normalize week to int where possible
-        def _to_int(v):
-            try:
-                return int(v)
-            except Exception:
-                return v
-        df = df.copy()
-        df["Week"] = df["Week"].apply(_to_int)
-        return df.drop_duplicates(subset=["Week"], keep="last")
-    return df.drop_duplicates(keep="last")
-
-def append_to_excel(new_data: pd.DataFrame, sheet_name: str, file_name: str = EXCEL_FILE):
-    """
-    Append/merge a DataFrame into an Excel sheet.
-    - If sheet exists and has 'Week', we keep only the latest row per Week (dedupe).
-    - Otherwise we drop exact duplicates.
-    """
+# ----------------------------
+def append_to_excel(new_data: pd.DataFrame, sheet_name: str, file_name: str = EXCEL_FILE, deduplicate: bool = True, keys=("Week",)):
+    """Append or replace a sheet with optional deduping by key columns."""
     import openpyxl
     from openpyxl.utils.dataframe import dataframe_to_rows
 
-    if new_data is None or new_data.empty:
-        return
-
-    # Ensure string columns for safety with openpyxl when mixed types
-    new_data = new_data.copy()
-    if "Week" in new_data.columns:
-        # force week to int when possible
-        try:
-            new_data["Week"] = new_data["Week"].astype(int)
-        except Exception:
-            pass
-
-    if os.path.exists(file_name):
-        book = openpyxl.load_workbook(file_name)
-        if sheet_name in book.sheetnames:
-            sheet = book[sheet_name]
-            existing = pd.DataFrame(sheet.values)
-            if len(existing) > 0:
                 existing.columns = existing.iloc[0]
-                existing = existing[1:]
+    try:
+        if os.path.exists(file_name):
+            book = openpyxl.load_workbook(file_name)
+            if sheet_name in book.sheetnames:
+                # Load existing sheet into DataFrame
+                ws = book[sheet_name]
+                existing = pd.DataFrame(ws.values)
+                if existing.shape[0] > 0:
+                    existing.columns = existing.iloc[0]
+                    existing = existing[1:]
+                else:
+                    existing = pd.DataFrame()
+
+                # Combine with new_data
+                combined = pd.concat([existing, new_data], ignore_index=True)
+
+                # Deduplicate if requested and keys present
+                if deduplicate and all(k in combined.columns for k in keys):
+                    combined = combined.drop_duplicates(subset=list(keys), keep="last")
             else:
-                existing = pd.DataFrame(columns=new_data.columns)
-
-            # align cols
-            combined = pd.concat([existing, new_data], ignore_index=True)
-            combined = _dedup_by_week(combined)
-
-            # wipe sheet and re-write
-            book.remove(sheet)
-            sheet = book.create_sheet(sheet_name)
-            for r in dataframe_to_rows(combined, index=False, header=True):
-                sheet.append(r)
+                combined = new_data.copy()
         else:
-            sheet = book.create_sheet(sheet_name)
-            for r in dataframe_to_rows(new_data, index=False, header=True):
-                sheet.append(r)
-        book.save(file_name)
-    else:
-        with pd.ExcelWriter(file_name, engine="openpyxl") as writer:
-            new_data.to_excel(writer, sheet_name=sheet_name, index=False)
+            book = openpyxl.Workbook()
+            book.remove(book.active)
+            combined = new_data.copy()
 
-def read_sheet(sheet_name: str) -> pd.DataFrame:
+        # Replace sheet
+        if sheet_name in book.sheetnames:
+            del book[sheet_name]
+        ws = book.create_sheet(sheet_name)
+        for r in dataframe_to_rows(combined, index=False, header=True):
+            ws.append(r)
+        book.save(file_name)
+    except Exception as e:
+        st.error(f"Excel append error: {e}")
+
+def load_sheet(name: str) -> pd.DataFrame:
     if not os.path.exists(EXCEL_FILE):
         return pd.DataFrame()
     try:
-        return pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
+        return pd.read_excel(EXCEL_FILE, sheet_name=name)
     except Exception:
         return pd.DataFrame()
 
-# =============================
-# File Uploaders
-# =============================
+def colorize_df(df: pd.DataFrame, context: str):
+    """Apply red/green highlighting for readability.
+    context: 'offense' or 'defense'
+    """
+    if df.empty:
+        return df
 
-st.sidebar.header("📤 Upload Weekly CSVs")
-uploaded_off = st.sidebar.file_uploader("Upload Offense CSV", type=["csv"])
-uploaded_def = st.sidebar.file_uploader("Upload Defense CSV", type=["csv"])
-uploaded_strat = st.sidebar.file_uploader("Upload Strategy CSV", type=["csv"])
-uploaded_pers = st.sidebar.file_uploader("Upload Personnel CSV", type=["csv"])
-uploaded_inj = st.sidebar.file_uploader("Upload Injuries CSV", type=["csv"])
-uploaded_snap = st.sidebar.file_uploader("Upload Snap Counts CSV", type=["csv"])
+    # Default benchmarks (tune later in app if you want)
+    # Explosive rate ~ 12% league avg; DSR ~ 72% league avg
+    exp_avg = 12.0
+    dsr_avg = 72.0
 
-if uploaded_off:
-    df_off = pd.read_csv(uploaded_off)
-    append_to_excel(df_off, "Offense")
-    st.success("✅ Offense data saved.")
-
-if uploaded_def:
-    df_def = pd.read_csv(uploaded_def)
-    append_to_excel(df_def, "Defense")
-    st.success("✅ Defense data saved.")
-
-if uploaded_strat:
-    df_strat = pd.read_csv(uploaded_strat)
-    append_to_excel(df_strat, "Strategy")
-    st.success("✅ Strategy data saved.")
-
-if uploaded_pers:
-    df_pers = pd.read_csv(uploaded_pers)
-    append_to_excel(df_pers, "Personnel")
-    st.success("✅ Personnel data saved.")
-
-if uploaded_inj:
-    df_inj = pd.read_csv(uploaded_inj)
-    append_to_excel(df_inj, "Injuries")
-    st.success("✅ Injuries data saved.")
-
-if uploaded_snap:
-    df_snap = pd.read_csv(uploaded_snap)
-    append_to_excel(df_snap, "SnapCounts")
-    st.success("✅ Snap counts data saved.")
-
-# =============================
-# Quick Injury Entry
-# =============================
-
-st.header("🩺 Injuries — quick entry")
-with st.form("injury_quick"):
-    iw = st.number_input("Week", min_value=1, max_value=MAX_WEEKS, value=1, step=1)
-    player = st.text_input("Player")
-    status = st.selectbox("Status", ["Questionable", "Doubtful", "Out", "IR", "PUP", "Active"])
-    body = st.text_input("Body Part / Note")
-    source = st.text_input("Source (optional)")
-    submitted = st.form_submit_button("Add Injury")
-if submitted and player:
-    row = pd.DataFrame([{
-        "Week": iw, "Player": player, "Status": status, "BodyPart": body, "Source": source
-    }])
-    append_to_excel(row, "Injuries")
-    st.success(f"✅ Added injury for Week {iw}: {player} — {status}")
-
-# =============================
-# Data Fetching (nfl_data_py)
-# =============================
-
-st.header("📡 Data Fetching")
-
-week_to_fetch = st.number_input("Enter Week # to fetch", min_value=1, max_value=MAX_WEEKS, step=1)
-
-# --- Weekly team basics (Offense/Defense) ---
-if st.button("Fetch Weekly Data (nfl_data_py)"):
-    try:
-        import nfl_data_py as nfl
-
-        # refresh cache (best effort)
-        try: nfl.update.weekly_data([SEASON])
-        except Exception: pass
-
-        weekly = nfl.import_weekly_data([SEASON])
-        wk = int(week_to_fetch)
-        team_week = weekly[(weekly["team"] == TEAM) & (weekly["week"] == wk)].copy()
-
-        if team_week.empty:
-            st.warning("No weekly team row found yet for that week.")
+    def style_func(val, positive_good=True, avg=0):
+        try:
+            v = float(val)
+        except Exception:
+            return ""
+        if positive_good:
+            # green if >= avg, red if lower
+            return "background-color: #e6ffe6" if v >= avg else "background-color: #ffe6e6"
         else:
-            team_week = team_week.copy()
-            team_week["Week"] = wk
+            # green if <= avg, red if higher
+            return "background-color: #e6ffe6" if v <= avg else "background-color: #ffe6e6"
 
-            # --- Offense mapping (best effort) ---
-            # Passing yards/attempts/completions
-            pass_yards = None
-            for c in ["passing_yards", "pass_yards", "yards"]:
-                if c in team_week.columns:
-                    pass_yards = team_week[c].values[0]; break
-            pass_att = None
-            for c in ["attempts", "passing_attempts", "pass_attempts", "pass_att"]:
-                if c in team_week.columns:
-                    pass_att = team_week[c].values[0]; break
-            completions = None
-            for c in ["completions", "passing_completions", "pass_completions", "pass_cmp"]:
-                if c in team_week.columns:
-                    completions = team_week[c].values[0]; break
+    styled = df.style
 
-            # YPA / CMP%
+    # Offense columns (higher is better)
+    off_cols_pos_good = [c for c in df.columns if c.lower() in
+                         ["explosive_play_rate", "drive_success_rate"]]
+    for c in off_cols_pos_good:
+        if c in df.columns:
+            styled = styled.map(lambda v, avg=exp_avg if "Explosive" in c else dsr_avg:
+                                style_func(v, positive_good=True, avg=avg), subset=[c])
+
+    # Defense allowed columns (lower is better)
+    def_cols_neg_good = [c for c in df.columns if c.lower() in
+                         ["explosive_play_rate_allowed", "drive_success_rate_allowed"]]
+    for c in def_cols_neg_good:
+        if c in df.columns:
+            styled = styled.map(lambda v, avg=exp_avg if "Explosive" in c else dsr_avg:
+                                style_func(v, positive_good=False, avg=avg), subset=[c])
+
+    return styled
+
+def _success_flag(down, ydstogo, yards_gained):
+    try:
+        if pd.isna(down) or pd.isna(ydstogo) or pd.isna(yards_gained):
+            return False
+        d = int(down); togo = float(ydstogo); gain = float(yards_gained)
+        if d == 1:
+            return gain >= 0.4 * togo
+        elif d == 2:
+            return gain >= 0.6 * togo
+        else:
+            return gain >= togo
+    except Exception:
+        return False
+
+# ----------------------------
+# Sidebar: Uploads
+# ----------------------------
+st.sidebar.header("📤 Upload New Weekly Data")
+uploaded_offense   = st.sidebar.file_uploader("Upload Offensive Analytics (.csv)", type="csv")
+uploaded_defense   = st.sidebar.file_uploader("Upload Defensive Analytics (.csv)", type="csv")
+uploaded_strategy  = st.sidebar.file_uploader("Upload Weekly Strategy (.csv)", type="csv")
+uploaded_personnel = st.sidebar.file_uploader("Upload Personnel Usage (.csv)", type="csv")
+uploaded_injuries  = st.sidebar.file_uploader("Upload Injuries (.csv) [optional]", type="csv")
+
+if uploaded_offense:
+    df_offense = pd.read_csv(uploaded_offense)
+    append_to_excel(df_offense, "Offense", deduplicate=True)
+    st.sidebar.success("✅ Offensive data uploaded.")
+if uploaded_defense:
+    df_defense = pd.read_csv(uploaded_defense)
+    append_to_excel(df_defense, "Defense", deduplicate=True)
+    st.sidebar.success("✅ Defensive data uploaded.")
+if uploaded_strategy:
+    df_strategy = pd.read_csv(uploaded_strategy)
+    append_to_excel(df_strategy, "Strategy", deduplicate=True)
+    st.sidebar.success("✅ Strategy data uploaded.")
+if uploaded_personnel:
+    df_personnel = pd.read_csv(uploaded_personnel)
+    append_to_excel(df_personnel, "Personnel", deduplicate=True)
+    st.sidebar.success("✅ Personnel data uploaded.")
+if uploaded_injuries:
+    df_inj = pd.read_csv(uploaded_injuries)
+    append_to_excel(df_inj, "Injuries", deduplicate=True, keys=("Week","Player"))
+    st.sidebar.success("✅ Injuries uploaded.")
+
+# ----------------------------
+# Sidebar: Fetch weekly team summary (basic)
+# ----------------------------
+with st.sidebar.expander("⚡ Fetch Weekly Team Data (nfl_data_py)"):
+    st.caption(f"Pulls {SEASON} weekly team stats for CHI and saves to Excel (basic fields).")
+    fetch_week = st.number_input("Week to fetch", min_value=1, max_value=25, value=1, step=1, key="fetch_week_basic")
+    if st.button("Fetch CHI Week (basic)"):
+        try:
+            import nfl_data_py as nfl
+
             try:
-                ypa_val = (float(pass_yards) / float(pass_att)) if pass_yards is not None and pass_att not in (None, 0) else None
+                nfl.update.weekly_data([SEASON])
             except Exception:
-                ypa_val = None
-            cmp_pct = None
-            if completions is not None and pass_att not in (None, 0):
+                pass
+
+            weekly = nfl.import_weekly_data([SEASON])
+            wk = int(fetch_week)
+            team_week = weekly[(weekly["team"] == TEAM) & (weekly["week"] == wk)].copy()
+
+            if team_week.empty:
+                st.warning("No weekly team row found for CHI in that week. Try again later.")
+            else:
+                team_week["Week"] = wk
+
+                # Map a few offense/defense basics if present
+                # Offense
+                pass_yards = team_week["passing_yards"].iloc[0] if "passing_yards" in team_week.columns else None
+                pass_att = None
+                for cand in ["attempts", "passing_attempts", "pass_attempts"]:
+                    if cand in team_week.columns:
+                        pass_att = team_week[cand].iloc[0]
+                        break
                 try:
-                    cmp_pct = round((float(completions) / float(pass_att)) * 100, 1)
+                    ypa_val = float(pass_yards) / float(pass_att) if pass_yards is not None and pass_att not in (None, 0) else None
                 except Exception:
-                    cmp_pct = None
+                    ypa_val = None
 
-            yards_total = None
-            for c in ["yards", "total_yards", "offense_yards"]:
-                if c in team_week.columns:
-                    yards_total = team_week[c].values[0]; break
+                completions = None
+                for cand in ["completions", "passing_completions", "pass_completions"]:
+                    if cand in team_week.columns:
+                        completions = team_week[cand].iloc[0]
+                        break
+                cmp_pct = None
+                if completions is not None and pass_att not in (None, 0):
+                    try:
+                        cmp_pct = round((float(completions) / float(pass_att)) * 100, 1)
+                    except Exception:
+                        cmp_pct = None
 
-            off_row = pd.DataFrame([{
-                "Week": wk,
-                "YPA": round(ypa_val, 2) if ypa_val is not None else None,
-                "YDS": yards_total,
-                "CMP%": cmp_pct
-            }])
+                off_row = pd.DataFrame([{
+                    "Week": wk,
+                    "YPA": round(ypa_val, 2) if ypa_val is not None else None,
+                    "CMP%": cmp_pct
+                }])
 
-            # --- Defense basics (sacks) ---
-            sacks_val = None
-            for c in ["sacks", "defense_sacks", "def_sacks"]:
-                if c in team_week.columns:
-                    sacks_val = team_week[c].values[0]; break
+                # Defense
+                sacks_val = None
+                for cand in ["sacks", "defense_sacks"]:
+                    if cand in team_week.columns:
+                        sacks_val = team_week[cand].iloc[0]
+                        break
 
-            def_row = pd.DataFrame([{
-                "Week": wk,
-                "SACK": sacks_val,
-                "RZ% Allowed": None  # will be filled by PBP fetch
-            }])
+                def_row = pd.DataFrame([{
+                    "Week": wk,
+                    "SACK": sacks_val
+                }])
 
-            append_to_excel(off_row, "Offense")
-            append_to_excel(def_row, "Defense")
-            st.success(f"✅ Added Week {wk} offense/defense basics.")
-    except Exception as e:
-        st.error(f"❌ Fetch failed: {e}")
+                append_to_excel(off_row, "Offense", deduplicate=True)
+                append_to_excel(def_row, "Defense", deduplicate=True)
+                append_to_excel(team_week.rename(columns=str), "Raw_Weekly", deduplicate=False)
 
-# --- Play-by-Play derived defense & offense advanced ---
-if st.button("Fetch Defensive Metrics from Play-by-Play"):
+                st.success(f"✅ Added CHI week {wk} basic fields to Offense/Defense.")
+        except Exception as e:
+            st.error(f"Fetch failed: {e}")
+
+# ----------------------------
+# Sidebar: Fetch play-by-play metrics (Advanced)
+# ----------------------------
+st.sidebar.markdown("### 📡 Fetch Advanced Metrics from Play-by-Play")
+pbp_week = st.sidebar.number_input("Week to fetch", min_value=1, max_value=25, value=1, step=1, key="pbp_week")
+
+if st.sidebar.button("Fetch PBP: RZ%, Success, Pressures, Explosive, DSR"):
     try:
         import nfl_data_py as nfl
+        wk = int(pbp_week)
 
-        wk = int(week_to_fetch)
         pbp = nfl.import_pbp_data([SEASON], downcast=False)
-
-        # Keep only real plays
+        # real plays only
         plays = pbp[
             (~pbp["play_type"].isin(["no_play"])) &
             (~pbp["penalty"].fillna(False))
         ].copy()
 
-        # ----- DEFENSE (CHI on defense) -----
+        # ---------- DEFENSE (CHI on defense) ----------
         bears_def = plays[(plays["week"] == wk) & (plays["defteam"] == TEAM)].copy()
-        if bears_def.empty:
-            st.warning("No CHI defensive plays yet for that week.")
+        if len(bears_def) == 0:
+            st.warning("No CHI defensive PBP rows found for that week.")
         else:
-            # Red Zone % Allowed (drive-based: any play inside 20 = red zone drive)
+            # Red Zone % Allowed: drives with min_yardline_100 <= 20
             dmins = (
                 bears_def.groupby(["game_id", "drive"], as_index=False)["yardline_100"]
-                .min().rename(columns={"yardline_100": "min_yardline_100"})
+                .min()
+                .rename(columns={"yardline_100": "min_yardline_100"})
             )
             total_drives = len(dmins)
             rz_drives = len(dmins[dmins["min_yardline_100"] <= 20]) if total_drives > 0 else 0
             rz_allowed = (rz_drives / total_drives * 100) if total_drives > 0 else 0.0
 
-            # Success Rate allowed
-            def _success_flag(down, togo, gain):
-                try:
-                    d = int(down); t = float(togo); g = float(gain)
-                except Exception:
-                    return False
-                if pd.isna(down) or pd.isna(togo) or pd.isna(gain):
-                    return False
-                if d == 1:
-                    return g >= 0.4 * t
-                elif d == 2:
-                    return g >= 0.6 * t
-                return g >= t
+            # Success rate allowed (opponent success vs CHI)
+            def_success = bears_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            def_success_pct = round(def_success * 100, 1) if pd.notna(def_success) else 0.0
 
-            def_sr = bears_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
-            def_sr_pct = round(def_sr * 100, 1) if pd.notna(def_sr) else None
-
-            # Pressures approx = sacks + QB hits
+            # Pressures = sacks + qb_hit flags
             qb_hits = bears_def["qb_hit"].fillna(0).astype(int).sum() if "qb_hit" in bears_def.columns else 0
             sacks = bears_def["sack"].fillna(0).astype(int).sum() if "sack" in bears_def.columns else 0
             pressures = int(qb_hits + sacks)
 
-            # Explosive plays allowed: rush >=10 OR pass >=20
-            def is_explosive(row):
-                yds = _safe_float(row.get("yards_gained"), 0)
-                is_pass = row.get("pass") == 1 or row.get("pass_attempt") == 1
-                is_rush = row.get("rush") == 1 or row.get("rush_attempt") == 1
-                if is_pass and yds is not None:
-                    return yds >= 20
-                if is_rush and yds is not None:
-                    return yds >= 10
-                return False
-            def_expl_pct = round(bears_def.apply(is_explosive, axis=1).mean() * 100, 1) if len(bears_def) else 0.0
+            # Explosive plays allowed: rush >=10 or pass >=20
+            def_exp = bears_def[
+                ((bears_def["rush_attempt"].fillna(0) == 1) & (bears_def["yards_gained"].fillna(0) >= 10)) |
+                ((bears_def["pass_attempt"].fillna(0) == 1) & (bears_def["yards_gained"].fillna(0) >= 20))
+            ]
+            total_def_plays = len(bears_def)
+            def_explosive_rate = round(len(def_exp) / total_def_plays * 100, 1) if total_def_plays else 0.0
 
-            # Red Zone TD% allowed: plays inside 20 that resulted in touchdown
-            rz_def = bears_def[bears_def["yardline_100"] <= 20]
-            if len(rz_def):
-                rz_td_allowed_pct = round((rz_def["touchdown"].fillna(0).astype(int).sum() / len(rz_def)) * 100, 1)
-            else:
-                rz_td_allowed_pct = 0.0
+            # Drive Success Rate (allowed): pct of opponent drives with any first down or points
+            def_drives = bears_def.groupby(["game_id", "drive"], as_index=False).agg(
+                any_fd=("first_down", lambda s: (s.fillna(0) == 1).any()),
+                any_points=("touchdown", lambda s: (s.fillna(0) == 1).any())
+            )
+            # If FG or safety not flagged, "any_points" above is minimal; we treat first downs OR touchdowns as success proxy.
+            def_dsr = round((def_drives["any_fd"] | def_drives["any_points"]).mean() * 100, 1) if len(def_drives) else 0.0
 
             adv_def = pd.DataFrame([{
                 "Week": wk,
-                "RZ% Allowed (Drives)": round(rz_allowed, 1),
-                "Success Rate% Allowed": def_sr_pct,
+                "RZ% Allowed": round(rz_allowed, 1),
+                "Success Rate% (Offense)": def_success_pct,  # offense success against CHI
                 "Pressures": pressures,
-                "Explosive% Allowed": def_expl_pct,
-                "RZ TD% Allowed (Plays)": rz_td_allowed_pct
+                "Explosive_Play_Rate_Allowed": def_explosive_rate,
+                "Drive_Success_Rate_Allowed": def_dsr
             }])
-            append_to_excel(adv_def, "Advanced_Defense")
+            append_to_excel(adv_def, "Advanced_Defense", deduplicate=True, keys=("Week",))
 
-        # ----- OFFENSE (CHI on offense) -----
+        # ---------- OFFENSE (CHI on offense) ----------
         bears_off = plays[(plays["week"] == wk) & (plays["posteam"] == TEAM)].copy()
-        if bears_off.empty:
-            st.info("No CHI offensive plays yet for that week.")
+        if len(bears_off) == 0:
+            st.info("No CHI offensive PBP rows found for that week.")
         else:
-            # Success Rate
-            def _success_flag_off(down, togo, gain):
-                try:
-                    d = int(down); t = float(togo); g = float(gain)
-                except Exception:
-                    return False
-                if pd.isna(down) or pd.isna(togo) or pd.isna(gain):
-                    return False
-                if d == 1:
-                    return g >= 0.4 * t
-                elif d == 2:
-                    return g >= 0.6 * t
-                return g >= t
-            off_sr = bears_off.apply(lambda r: _success_flag_off(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
-            off_sr_pct = round(off_sr * 100, 1) if pd.notna(off_sr) else None
+            # Explosive plays: rush >=10 or pass >=20
+            off_exp = bears_off[
+                ((bears_off["rush_attempt"].fillna(0) == 1) & (bears_off["yards_gained"].fillna(0) >= 10)) |
+                ((bears_off["pass_attempt"].fillna(0) == 1) & (bears_off["yards_gained"].fillna(0) >= 20))
+            ]
+            total_off_plays = len(bears_off)
+            off_explosive_rate = round(len(off_exp) / total_off_plays * 100, 1) if total_off_plays else 0.0
 
-            # Explosive made
-            def is_explosive_off(row):
-                yds = _safe_float(row.get("yards_gained"), 0)
-                is_pass = row.get("pass") == 1 or row.get("pass_attempt") == 1
-                is_rush = row.get("rush") == 1 or row.get("rush_attempt") == 1
-                if is_pass and yds is not None:
-                    return yds >= 20
-                if is_rush and yds is not None:
-                    return yds >= 10
-                return False
-            off_expl_pct = round(bears_off.apply(is_explosive_off, axis=1).mean() * 100, 1) if len(bears_off) else 0.0
-
-            # Red Zone TD% scored (play-based)
-            rz_off = bears_off[bears_off["yardline_100"] <= 20]
-            if len(rz_off):
-                rz_td_scored_pct = round((rz_off["touchdown"].fillna(0).astype(int).sum() / len(rz_off)) * 100, 1)
-            else:
-                rz_td_scored_pct = 0.0
+            # Drive Success Rate (offense): pct of CHI drives with any first down or points
+            off_drives = bears_off.groupby(["game_id", "drive"], as_index=False).agg(
+                any_fd=("first_down", lambda s: (s.fillna(0) == 1).any()),
+                any_points=("touchdown", lambda s: (s.fillna(0) == 1).any())
+            )
+            off_dsr = round((off_drives["any_fd"] | off_drives["any_points"]).mean() * 100, 1) if len(off_drives) else 0.0
 
             adv_off = pd.DataFrame([{
                 "Week": wk,
-                "Success Rate%": off_sr_pct,
-                "Explosive%": off_expl_pct,
-                "RZ TD%": rz_td_scored_pct
+                "Explosive_Play_Rate": off_explosive_rate,
+                "Drive_Success_Rate": off_dsr
             }])
-            append_to_excel(adv_off, "Advanced_Offense")
+            append_to_excel(adv_off, "Advanced_Offense", deduplicate=True, keys=("Week",))
 
-        st.success(f"✅ Week {wk} PBP advanced metrics saved (offense & defense).")
-
+        st.success(f"✅ Advanced metrics saved for Week {wk}.")
     except Exception as e:
         st.error(f"❌ Failed to fetch PBP metrics: {e}")
 
-# --- Snap Counts (placeholder stub) ---
-if st.button("Fetch Snap Counts (best effort)"):
-    st.info(f"Fetching snap counts for week {week_to_fetch}… (placeholder)")
-    # You can later map an API here and then append_to_excel(df, "SnapCounts")
+# ----------------------------
+# Download full Excel
+# ----------------------------
+if os.path.exists(EXCEL_FILE):
+    with open(EXCEL_FILE, "rb") as f:
+        st.sidebar.download_button(
+            label="⬇️ Download All Data (Excel)",
+            data=f,
+            file_name=EXCEL_FILE,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-# --- Opponent Preview (placeholder fetch) ---
-if st.button("Fetch Opponent Preview (best effort)"):
-    st.info(f"Fetching opponent preview for week {week_to_fetch}… (placeholder)")
-    # Later: pull basic opp splits, last-3 trend, injuries, etc., and save to "Opponent_Preview"
+# ----------------------------
+# Visible data sections (merge advanced where available)
+# ----------------------------
+st.subheader("📊 Offensive Analytics")
+df_off = load_sheet("Offense")
+df_adv_off = load_sheet("Advanced_Offense")
+if not df_off.empty and not df_adv_off.empty and "Week" in df_off.columns and "Week" in df_adv_off.columns:
+    off_display = df_off.merge(df_adv_off, on="Week", how="left")
+else:
+    off_display = df_off if not df_off.empty else df_adv_off
 
-# =============================
-# DVOA-like Proxy (opponent-adjusted)
-# =============================
+if not off_display.empty:
+    try:
+        st.dataframe(colorize_df(off_display, "offense"), use_container_width=True)
+    except Exception:
+        st.dataframe(off_display, use_container_width=True)
+else:
+    st.info("No offense data yet.")
 
-st.header("📊 DVOA-like Proxy")
-week_for_proxy = st.number_input("Week to compute Proxy", min_value=1, max_value=MAX_WEEKS, step=1)
+st.subheader("🛡️ Defensive Analytics")
+df_def = load_sheet("Defense")
+df_adv_def = load_sheet("Advanced_Defense")
+if not df_def.empty and not df_adv_def.empty and "Week" in df_def.columns and "Week" in df_adv_def.columns:
+    def_display = df_def.merge(df_adv_def, on="Week", how="left")
+else:
+    def_display = df_def if not df_def.empty else df_adv_def
 
-if st.button("Compute DVOA-like Proxy (Opponent Adjusted)"):
+if not def_display.empty:
+    try:
+        st.dataframe(colorize_df(def_display, "defense"), use_container_width=True)
+    except Exception:
+        st.dataframe(def_display, use_container_width=True)
+else:
+    st.info("No defense data yet.")
+
+# ----------------------------
+# Media summaries
+# ----------------------------
+st.markdown("### 📰 Weekly Beat Writer / ESPN Summary")
+with st.form("media_form"):
+    media_week = st.number_input("Week", min_value=1, max_value=25, step=1, key="media_week_input")
+    media_opponent = st.text_input("Opponent")
+    media_summary = st.text_area("Beat Writer & ESPN Summary (Game Recap, Analysis, Strategy, etc.)")
+    submit_media = st.form_submit_button("Save Summary")
+
+if submit_media:
+    media_df = pd.DataFrame([{
+        "Week": media_week,
+        "Opponent": media_opponent,
+        "Summary": media_summary
+    }])
+    append_to_excel(media_df, "Media_Summaries", deduplicate=False)
+    st.success(f"✅ Summary for Week {media_week} vs {media_opponent} saved.")
+
+# Show media
+df_media = load_sheet("Media_Summaries")
+if not df_media.empty:
+    st.subheader("📰 Saved Media Summaries")
+    st.dataframe(df_media, use_container_width=True)
+
+# ----------------------------
+# DVOA-like Proxy (opponent-adjusted EPA/SR)
+# ----------------------------
+st.markdown("### 📈 Compute DVOA-like Proxy (Opponent-Adjusted)")
+proxy_week = st.number_input("Week to Compute (proxy)", min_value=1, max_value=25, value=1, step=1, key="proxy_week")
+
+if st.button("Compute DVOA-like Proxy"):
     try:
         import nfl_data_py as nfl
 
-        wk = int(week_for_proxy)
+        wk = int(proxy_week)
         pbp = nfl.import_pbp_data([SEASON], downcast=False)
 
-        base = pbp[
+        plays = pbp[
             (~pbp["play_type"].isin(["no_play"])) &
             (~pbp["penalty"].fillna(False)) &
             (~pbp["epa"].isna())
         ].copy()
 
-        bears_off = base[(base["week"] == wk) & (base["posteam"] == TEAM)].copy()
-        bears_def = base[(base["week"] == wk) & (base["defteam"] == TEAM)].copy()
+        bears_off = plays[(plays["week"] == wk) & (plays["posteam"] == TEAM)].copy()
+        bears_def = plays[(plays["week"] == wk) & (plays["defteam"] == TEAM)].copy()
 
         if bears_off.empty and bears_def.empty:
             st.warning("No CHI plays found for that week yet.")
         else:
-            # figure opponent
             opps = set()
-            if not bears_off.empty: opps.update(bears_off["defteam"].unique().tolist())
-            if not bears_def.empty: opps.update(bears_def["posteam"].unique().tolist())
+            if not bears_off.empty:
+                opps.update(bears_off["defteam"].unique().tolist())
+            if not bears_def.empty:
+                opps.update(bears_def["posteam"].unique().tolist())
             opponent = list(opps)[0] if opps else "UNK"
 
-            prior = base[base["week"] < wk].copy()
+            prior = plays[plays["week"] < wk].copy()
 
-            # opponent defensive benchmarks (allowed vs them)
-            opp_def = prior[prior["defteam"] == opponent]
-            opp_def_epa = opp_def["epa"].mean() if len(opp_def) else None
+            # Opponent defensive benchmarks (allowed vs them)
+            opp_def_plays = prior[prior["defteam"] == opponent].copy()
+            opp_def_epa = opp_def_plays["epa"].mean() if len(opp_def_plays) else None
+            if len(opp_def_plays):
+                opp_def_success = opp_def_plays.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                opp_def_success = None
 
-            def _success_flag(down, ydstogo, yards_gained):
-                try:
-                    d = int(down); t = float(ydstogo); g = float(yards_gained)
-                except Exception:
-                    return False
-                if pd.isna(down) or pd.isna(ydstogo) or pd.isna(yards_gained):
-                    return False
-                if d == 1: return g >= 0.4 * t
-                if d == 2: return g >= 0.6 * t
-                return g >= t
+            # Opponent offensive benchmarks (their offense)
+            opp_off_plays = prior[prior["posteam"] == opponent].copy()
+            opp_off_epa = opp_off_plays["epa"].mean() if len(opp_off_plays) else None
+            if len(opp_off_plays):
+                opp_off_success = opp_off_plays.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+            else:
+                opp_off_success = None
 
-            opp_def_sr = opp_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean() if len(opp_def) else None
-
-            # opponent offensive benchmarks (their offense)
-            opp_off = prior[prior["posteam"] == opponent]
-            opp_off_epa = opp_off["epa"].mean() if len(opp_off) else None
-            opp_off_sr = opp_off.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean() if len(opp_off) else None
-
-            # CHI week epa/sr
+            # Bears week EPA/SR on offense & defense
             if len(bears_off):
                 chi_off_epa = bears_off["epa"].mean()
-                chi_off_sr = bears_off.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+                chi_off_success = bears_off.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
             else:
-                chi_off_epa = None; chi_off_sr = None
+                chi_off_epa = None; chi_off_success = None
 
             if len(bears_def):
                 chi_def_epa_allowed = bears_def["epa"].mean()
-                chi_def_sr_allowed = bears_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
+                chi_def_success_allowed = bears_def.apply(lambda r: _success_flag(r.get("down"), r.get("ydstogo"), r.get("yards_gained")), axis=1).mean()
             else:
-                chi_def_epa_allowed = None; chi_def_sr_allowed = None
+                chi_def_epa_allowed = None; chi_def_success_allowed = None
 
-            def diff(a, b):
-                if a is None or pd.isna(a) or b is None or pd.isna(b): return None
+            def safe_diff(a, b):
+                if a is None or pd.isna(a) or b is None or pd.isna(b):
+                    return None
                 return float(a) - float(b)
 
-            off_adj_epa = diff(chi_off_epa, opp_def_epa)
-            off_adj_sr  = diff(chi_off_sr, opp_def_sr)
-            def_adj_epa = diff(chi_def_epa_allowed, opp_off_epa)
-            def_adj_sr  = diff(chi_def_sr_allowed, opp_off_sr)
+            off_adj_epa = safe_diff(chi_off_epa, opp_def_epa)
+            off_adj_sr  = safe_diff(chi_off_success, opp_def_success)
+            def_adj_epa = safe_diff(chi_def_epa_allowed, opp_off_epa)
+            def_adj_sr  = safe_diff(chi_def_success_allowed, opp_off_success)
 
             out = pd.DataFrame([{
                 "Week": wk,
@@ -470,126 +485,100 @@ if st.button("Compute DVOA-like Proxy (Opponent Adjusted)"):
                 "Off EPA/play": round(chi_off_epa, 3) if chi_off_epa is not None else None,
                 "Def EPA allowed/play": round(chi_def_epa_allowed, 3) if chi_def_epa_allowed is not None else None
             }])
-            append_to_excel(out, "DVOA_Proxy")
-            st.success(f"✅ DVOA-like proxy saved for Week {wk} vs {opponent}")
-            try:
-                st.dataframe(out.style.background_gradient(cmap="RdYlGn"))
-            except Exception:
-                st.dataframe(out)
+
+            append_to_excel(out, "DVOA_Proxy", deduplicate=True, keys=("Week",))
+            st.success(
+                f"✅ DVOA-like proxy saved for Week {wk} vs {opponent} "
+                f"(Off Adj EPA/play={out.iloc[0]['Off Adj EPA/play']}, Off Adj SR%={out.iloc[0]['Off Adj SR%']}, "
+                f"Def Adj EPA/play={out.iloc[0]['Def Adj EPA/play']}, Def Adj SR%={out.iloc[0]['Def Adj SR%']})"
+            )
     except Exception as e:
-        st.error(f"Error computing DVOA Proxy: {e}")
+        st.error(f"❌ Failed to compute proxy: {e}")
 
-# =============================
-# Opponent Preview
-# =============================
+# Preview DVOA Proxy
+df_dvoa = load_sheet("DVOA_Proxy")
+if not df_dvoa.empty:
+    st.subheader("📊 DVOA-like Proxy Metrics")
+    st.dataframe(df_dvoa.tail(10), use_container_width=True)
 
-st.header("🔎 Opponent Preview")
+# ----------------------------
+# Weekly Prediction (simple rule set)
+# ----------------------------
+st.markdown("### 🔮 Weekly Game Prediction")
+week_to_predict = st.number_input("Select Week to Predict", min_value=1, max_value=25, step=1, key="predict_week_input")
 
-try:
-    strat = read_sheet("Strategy")
-    if not strat.empty and "Week" in strat and "Opponent" in strat:
-        wk_prev = st.number_input("Select week to preview opponent", min_value=1, max_value=MAX_WEEKS, step=1)
-        row = strat[strat["Week"] == wk_prev]
-        if not row.empty:
-            opp = str(row.iloc[0]["Opponent"])
-            st.subheader(f"Opponent: {opp}")
-            # Injuries
-            inj = read_sheet("Injuries")
-            inj_wk = inj[inj["Week"] == wk_prev] if not inj.empty else pd.DataFrame()
-            st.write(f"**Injury count (our team): {len(inj_wk)}**")
-            # Trend placeholders
-            st.write("📈 Efficiency trend (TBD)")
-        else:
-            st.info("No opponent info for that week yet.")
-    else:
-        st.info("No Strategy sheet with Week/Opponent yet.")
-except Exception as e:
-    st.error(f"Error loading opponent preview: {e}")
-
-# =============================
-# Weekly Prediction
-# =============================
-
-st.header("🔮 Weekly Game Prediction")
-week_to_predict = st.number_input("Select Week to Predict", min_value=1, max_value=MAX_WEEKS, step=1)
+def _safe_float(x, default=None):
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 if os.path.exists(EXCEL_FILE):
     try:
-        # base sheets
-        df_strategy = read_sheet("Strategy")
-        df_offense = read_sheet("Offense")
-        df_defense = read_sheet("Defense")
-        # advanced
-        df_aoff = read_sheet("Advanced_Offense")
-        df_adef = read_sheet("Advanced_Defense")
-        df_proxy = read_sheet("DVOA_Proxy")
+        df_strategy = load_sheet("Strategy")
+        df_offense  = load_sheet("Offense")
+        df_defense  = load_sheet("Defense")
+        df_advdef   = load_sheet("Advanced_Defense")
+        df_proxy    = load_sheet("DVOA_Proxy")
 
         row_s = df_strategy[df_strategy["Week"] == week_to_predict] if not df_strategy.empty else pd.DataFrame()
-        row_o = df_offense[df_offense["Week"] == week_to_predict] if not df_offense.empty else pd.DataFrame()
-        row_d = df_defense[df_defense["Week"] == week_to_predict] if not df_defense.empty else pd.DataFrame()
-        row_aoff = df_aoff[df_aoff["Week"] == week_to_predict] if not df_aoff.empty else pd.DataFrame()
-        row_adef = df_adef[df_adef["Week"] == week_to_predict] if not df_adef.empty else pd.DataFrame()
-        row_p = df_proxy[df_proxy["Week"] == week_to_predict] if not df_proxy.empty else pd.DataFrame()
+        row_o = df_offense[df_offense["Week"] == week_to_predict]  if not df_offense.empty  else pd.DataFrame()
+        row_d = df_defense[df_defense["Week"] == week_to_predict]  if not df_defense.empty  else pd.DataFrame()
+        row_a = df_advdef[df_advdef["Week"] == week_to_predict]    if not df_advdef.empty   else pd.DataFrame()
+        row_p = df_proxy[df_proxy["Week"] == week_to_predict]      if not df_proxy.empty    else pd.DataFrame()
 
         if not row_s.empty and not row_o.empty and not row_d.empty:
             strategy_text = row_s.iloc[0].astype(str).str.cat(sep=" ").lower()
 
-            # pulls
-            ypa = _safe_float(row_o.iloc[0].get("YPA"), None)
+            ypa = _safe_float(row_o.iloc[0].get("YPA"), default=None)
 
-            rz_allowed = None
-            pressures = None
-            def_sr_allowed = None
-            expl_allowed = None
-            rz_td_allowed = None
-
-            if not row_adef.empty:
-                rz_allowed = _safe_float(row_adef.iloc[0].get("RZ% Allowed (Drives)"), None)
-                pressures = _safe_float(row_adef.iloc[0].get("Pressures"), None)
-                def_sr_allowed = _safe_float(row_adef.iloc[0].get("Success Rate% Allowed"), None)
-                expl_allowed = _safe_float(row_adef.iloc[0].get("Explosive% Allowed"), None)
-                rz_td_allowed = _safe_float(row_adef.iloc[0].get("RZ TD% Allowed (Plays)"), None)
+            # Prefer Advanced_Defense values when available
+            rz_allowed = _safe_float(row_a.iloc[0].get("RZ% Allowed"), default=None) if not row_a.empty else None
+            pressures  = _safe_float(row_a.iloc[0].get("Pressures"), default=None)   if not row_a.empty else None
             if rz_allowed is None:
-                rz_allowed = _safe_float(row_d.iloc[0].get("RZ% Allowed"), None)
+                rz_allowed = _safe_float(row_d.iloc[0].get("RZ% Allowed"), default=None)
 
             off_adj_epa = off_adj_sr = def_adj_epa = def_adj_sr = None
             if not row_p.empty:
-                off_adj_epa = _safe_float(row_p.iloc[0].get("Off Adj EPA/play"), None)
-                off_adj_sr  = _safe_float(row_p.iloc[0].get("Off Adj SR%"), None)
-                def_adj_epa = _safe_float(row_p.iloc[0].get("Def Adj EPA/play"), None)
-                def_adj_sr  = _safe_float(row_p.iloc[0].get("Def Adj SR%"), None)
+                off_adj_epa = _safe_float(row_p.iloc[0].get("Off Adj EPA/play"), default=None)
+                off_adj_sr  = _safe_float(row_p.iloc[0].get("Off Adj SR%"), default=None)
+                def_adj_epa = _safe_float(row_p.iloc[0].get("Def Adj EPA/play"), default=None)
+                def_adj_sr  = _safe_float(row_p.iloc[0].get("Def Adj SR%"), default=None)
 
             # Rule set
             reason_bits = []
-
             if (off_adj_epa is not None and off_adj_epa >= 0.15) and (def_adj_epa is not None and def_adj_epa <= -0.05):
-                prediction = "Win – efficiency edge on both sides"
-                reason_bits.append(f"Off+{off_adj_epa:+.2f} EPA/play")
-                reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play")
+                prediction = "Win - efficiency edge on both sides"
+                reason_bits.append(f"Off+{off_adj_epa:+.2f} EPA/play vs opp D")
+                reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play vs opp O")
             elif (pressures is not None and pressures >= 8) and ("blitz" in strategy_text or "pressure" in strategy_text):
-                prediction = "Win – pass rush advantage"
+                prediction = "Win - pass rush advantage"
                 reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None: reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
+                if rz_allowed is not None:
+                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
             elif (rz_allowed is not None and rz_allowed < 50) and any(tok in strategy_text for tok in ["zone", "two-high", "split-safety"]):
-                prediction = "Win – red zone + coverage advantage"
+                prediction = "Win - red zone + coverage advantage"
                 reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
             elif (off_adj_epa is not None and off_adj_epa <= -0.10) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss – inefficient offense and poor red zone defense"
+                prediction = "Loss - inefficient offense and poor red zone defense"
                 reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
                 reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
             elif (ypa is not None and ypa < 6) and (rz_allowed is not None and rz_allowed > 65):
-                prediction = "Loss – inefficient passing and weak red zone defense"
+                prediction = "Loss - inefficient passing and weak red zone defense"
                 reason_bits.append(f"YPA={ypa:.1f}")
                 reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
             else:
-                prediction = "Loss – no clear advantage"
-                if off_adj_epa is not None: reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
-                if def_adj_epa is not None: reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play")
-                if pressures is not None: reason_bits.append(f"Pressures={int(pressures)}")
-                if rz_allowed is not None: reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
-                if def_sr_allowed is not None: reason_bits.append(f"Def SR%={def_sr_allowed:.1f}")
-                if expl_allowed is not None: reason_bits.append(f"Explosive% Allowed={expl_allowed:.1f}")
-                if rz_td_allowed is not None: reason_bits.append(f"RZ TD% Allowed={rz_td_allowed:.1f}")
+                prediction = "Loss - no clear advantage in key strategy or stats"
+                if off_adj_epa is not None:
+                    reason_bits.append(f"Off{off_adj_epa:+.2f} EPA/play")
+                if def_adj_epa is not None:
+                    reason_bits.append(f"Def{def_adj_epa:+.2f} EPA/play")
+                if pressures is not None:
+                    reason_bits.append(f"Pressures={int(pressures)}")
+                if rz_allowed is not None:
+                    reason_bits.append(f"RZ% Allowed={rz_allowed:.0f}")
 
             reason_text = " | ".join(reason_bits)
             st.success(f"**Predicted Outcome for Week {week_to_predict}: {prediction}**")
@@ -597,89 +586,22 @@ if os.path.exists(EXCEL_FILE):
                 st.caption(reason_text)
 
             # Save prediction
-            pred_row = pd.DataFrame([{
+            pred_save = pd.DataFrame([{
                 "Week": week_to_predict,
-                "Prediction": prediction.split("–")[0].strip(),
-                "Reason": prediction.split("–")[1].strip() if "–" in prediction else "",
+                "Prediction": prediction.split("-")[0].strip(),
+                "Reason": prediction[prediction.find("-")+1:].strip() if "-" in prediction else "",
                 "Notes": reason_text
             }])
-            append_to_excel(pred_row, "Predictions")
+            append_to_excel(pred_save, "Predictions", deduplicate=True, keys=("Week",))
         else:
-            st.info("Please upload/fetch Strategy, Offense, and Defense data for this week first.")
+            st.info("Please upload/fetch Strategy, Offense, and Defense for this week first.")
     except Exception as e:
         st.warning(f"Prediction failed. Check data. Error: {e}")
 
-# =============================
-# Preview Panels
-# =============================
-
-st.header("👀 Quick Previews")
-off = read_sheet("Offense")
-defn = read_sheet("Defense")
-aoff = read_sheet("Advanced_Offense")
-adef = read_sheet("Advanced_Defense")
-dvoa = read_sheet("DVOA_Proxy")
-preds = read_sheet("Predictions")
-inj = read_sheet("Injuries")
-pers = read_sheet("Personnel")
-
-if not off.empty:
-    st.subheader("Offense")
-    try:
-        st.dataframe(off.style.background_gradient(subset=["YPA","CMP%"], cmap="RdYlGn"))
-    except Exception:
-        st.dataframe(off)
-
-if not defn.empty:
-    st.subheader("Defense")
-    try:
-        st.dataframe(defn.style.background_gradient(subset=["SACK","RZ% Allowed"], cmap="RdYlGn_r"))
-    except Exception:
-        st.dataframe(defn)
-
-if not aoff.empty:
-    st.subheader("Advanced Offense (from PBP)")
-    try:
-        st.dataframe(aoff.style.background_gradient(subset=["Success Rate%","Explosive%","RZ TD%"], cmap="RdYlGn"))
-    except Exception:
-        st.dataframe(aoff)
-
-if not adef.empty:
-    st.subheader("Advanced Defense (from PBP)")
-    try:
-        st.dataframe(adef.style.background_gradient(subset=["Success Rate% Allowed","Explosive% Allowed","RZ TD% Allowed (Plays)"], cmap="RdYlGn_r"))
-    except Exception:
-        st.dataframe(adef)
-
-if not dvoa.empty:
-    st.subheader("DVOA-like Proxy")
-    try:
-        st.dataframe(dvoa.style.background_gradient(cmap="RdYlGn"))
-    except Exception:
-        st.dataframe(dvoa)
-
-if not preds.empty:
+# Show saved predictions
+df_preds = load_sheet("Predictions")
+if not df_preds.empty:
     st.subheader("📈 Saved Game Predictions")
-    st.dataframe(preds)
-
-if not inj.empty:
-    st.subheader("Injuries")
-    st.dataframe(inj)
-
-if not pers.empty:
-    st.subheader("Personnel")
-    st.dataframe(pers)
-
-# =============================
-# Download
-# =============================
-
-st.sidebar.header("📥 Download Data")
-if os.path.exists(EXCEL_FILE):
-    with open(EXCEL_FILE, "rb") as f:
-        st.sidebar.download_button(
-            label="Download All Data (Excel)",
-            data=f,
-            file_name=EXCEL_FILE,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    st.dataframe(df_preds, use_container_width=True)
+else:
+    st.info("No predictions saved yet.")
