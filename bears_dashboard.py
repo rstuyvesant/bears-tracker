@@ -318,6 +318,7 @@ if st.sidebar.button("Fetch PBP: RZ%, Success, Pressures, Explosive, DSR"):
                 any_points=("touchdown", lambda s: (s.fillna(0) == 1).any())
             )
             off_dsr = round((off_drives["any_fd"] | off_drives["any_points"]).mean() * 100, 1) if len(off_drives) else 0.0
+status = st.selectbox("Status", ["Questionable", "Doubtful", "Out"])
 
             adv_off = pd.DataFrame([{
                 "Week": wk,
