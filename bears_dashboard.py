@@ -12,6 +12,172 @@ st.markdown("Track weekly stats, strategy, personnel usage, injuries, snap count
 
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
 
+EXCEL_PATH = EXCEL_FILE if "EXCEL_FILE" in globals() else "bears_weekly_analytics.xlsx"
+
+def _safe_read_sheet(file_path: str, sheet_name: str) -> pd.DataFrame:
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
+    try:
+        return pd.read_excel(file_path, sheet_name=sheet_name)
+    except Exception:
+        return pd.DataFrame()
+
+def _find_candidate_sheets(file_path: str) -> dict:
+    dfs = {}
+    if not os.path.exists(file_path):
+        return dfs
+    try:
+        xl = pd.ExcelFile(file_path)
+        for s in xl.sheet_names:
+            s_lower = s.lower()
+            if any(k in s_lower for k in ["offense", "offensive"]):
+                dfs.setdefault("offense", []).append(pd.read_excel(file_path, sheet_name=s))
+            if any(k in s_lower for k in ["defense", "defensive"]):
+                dfs.setdefault("defense", []).append(pd.read_excel(file_path, sheet_name=s))
+            if any(k in s_lower for k in ["playbyplay", "play_by_play", "play-by-play", "pbp"]):
+                dfs.setdefault("playbyplay", []).append(pd.read_excel(file_path, sheet_name=s))
+    except Exception:
+        pass
+    for k, v in list(dfs.items()):
+        dfs[k] = pd.concat(v, ignore_index=True) if v else pd.DataFrame()
+    return dfs
+
+def _select_metric_columns(df: pd.DataFrame, preferred_cols: list[str]) -> list[str]:
+    return [c for c in preferred_cols if c in df.columns]
+
+def _numeric_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+def _clean_week(df: pd.DataFrame) -> pd.DataFrame:
+    week_col = None
+    for c in df.columns:
+        if c.lower() in ["week", "wk", "game_week"]:
+            week_col = c
+            break
+    if week_col:
+        df = df.copy()
+        df["Week"] = pd.to_numeric(df[week_col], errors="coerce").astype("Int64")
+    return df
+
+def _compute_avgs(df: pd.DataFrame, metrics: list[str]):
+    if df.empty or not metrics:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = _clean_week(df)
+    season_avgs = df[metrics].mean(numeric_only=True)
+    season_table = season_avgs.reset_index().rename(columns={"index": "Metric", 0: "League_Average"})
+    season_wide = pd.DataFrame({f"NFL Avg {m}": [season_avgs[m]] for m in season_avgs.index})
+
+    if "Week" in df.columns:
+        weekly = df.groupby("Week")[metrics].mean(numeric_only=True).reset_index()
+    else:
+        weekly = pd.DataFrame()
+
+    return season_table, weekly, season_wide
+
+def _write_nfl_averages_sheet(file_path: str,
+                              season_off: pd.DataFrame, weekly_off: pd.DataFrame,
+                              season_def: pd.DataFrame, weekly_def: pd.DataFrame,
+                              season_pbp: pd.DataFrame, weekly_pbp: pd.DataFrame):
+    mode = "a" if os.path.exists(file_path) else "w"
+    with pd.ExcelWriter(file_path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        idx_df = pd.DataFrame({"Section": ["GeneratedAt"], "Value": [pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")]})
+        idx_df.to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=0)
+
+        def _dump(df: pd.DataFrame, startrow: int, title: str) -> int:
+            pd.DataFrame({"Section": [title]}).to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=startrow)
+            startrow += 1
+            if not df.empty:
+                df.to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=startrow)
+                startrow += len(df) + 2
+            else:
+                pd.DataFrame({"Info": ["(no data)"]}).to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=startrow)
+                startrow += 3
+            return startrow
+
+        row = 3
+        row = _dump(season_off, row, "Season Averages - Offense")
+        row = _dump(weekly_off, row, "Weekly Averages - Offense")
+        row = _dump(season_def, row, "Season Averages - Defense")
+        row = _dump(weekly_def, row, "Weekly Averages - Defense")
+        row = _dump(season_pbp, row, "Season Averages - PlayByPlay")
+        row = _dump(weekly_pbp, row, "Weekly Averages - PlayByPlay")
+
+def _merge_nfl_avgs_into_preview(preview_df: pd.DataFrame, season_wide: pd.DataFrame) -> pd.DataFrame:
+    if preview_df is None or preview_df.empty or season_wide.empty:
+        return preview_df
+    season_wide_broadcast = pd.concat([season_wide] * len(preview_df), ignore_index=True)
+    season_wide_broadcast.index = preview_df.index
+    return pd.concat([preview_df, season_wide_broadcast], axis=1)
+
+PREFERRED_OFF_METRICS = ["YPA","YPC","CMP%","QBR","EPA/Play","Success Rate","Points/Game","Red Zone %","3rd Down %","Explosive Play %","SACKs Allowed","INTs Thrown","Fumbles Lost","YAC","DVOA_Proxy_Off"]
+PREFERRED_DEF_METRICS = ["SACKs","INTs","FF","FR","QB Hits","Pressures","DVOA","DVOA_Proxy_Def","3D% Allowed","RZ% Allowed","EPA/Play Allowed","Success Rate Allowed","YPA Allowed","YPC Allowed","CMP% Allowed"]
+PREFERRED_PBP_METRICS = ["EPA","Succ","AirYards","YAC","WPA"]
+
+st.markdown("### 🧮 Compute NFL Averages")
+with st.expander("Compute NFL Averages (write to Excel and optionally merge into previews)", expanded=False):
+    do_merge = st.checkbox("Also add “NFL Avg …” columns to my Offense/Defense preview tables", value=True)
+    if st.button("Compute & Save NFL Averages"):
+        if not os.path.exists(EXCEL_PATH):
+            st.error(f"Excel file not found: {EXCEL_PATH}")
+        else:
+            dfs = _find_candidate_sheets(EXCEL_PATH)
+
+            # OFFENSE
+            off_df = dfs.get("offense", pd.DataFrame())
+            off_metrics = _select_metric_columns(off_df, PREFERRED_OFF_METRICS) if not off_df.empty else []
+            if not off_metrics and not off_df.empty:
+                off_metrics = _numeric_columns(off_df)
+            season_off_tbl, weekly_off_tbl, season_off_wide = _compute_avgs(off_df, off_metrics)
+
+            # DEFENSE
+            def_df = dfs.get("defense", pd.DataFrame())
+            def_metrics = _select_metric_columns(def_df, PREFERRED_DEF_METRICS) if not def_df.empty else []
+            if not def_metrics and not def_df.empty:
+                def_metrics = _numeric_columns(def_df)
+            season_def_tbl, weekly_def_tbl, season_def_wide = _compute_avgs(def_df, def_metrics)
+
+            # PLAY-BY-PLAY
+            pbp_df = dfs.get("playbyplay", pd.DataFrame())
+            pbp_metrics = _select_metric_columns(pbp_df, PREFERRED_PBP_METRICS) if not pbp_df.empty else []
+            if not pbp_metrics and not pbp_df.empty:
+                pbp_metrics = _numeric_columns(pbp_df)
+            season_pbp_tbl, weekly_pbp_tbl, _ = _compute_avgs(pbp_df, pbp_metrics)
+
+            try:
+                _write_nfl_averages_sheet(EXCEL_PATH,
+                                          season_off_tbl, weekly_off_tbl,
+                                          season_def_tbl, weekly_def_tbl,
+                                          season_pbp_tbl, weekly_pbp_tbl)
+                st.success("✅ Wrote season & weekly NFL averages to 'NFL_Averages' sheet.")
+            except Exception as e:
+                st.error(f"Could not write NFL_Averages sheet: {e}")
+
+            if do_merge:
+                off_prev = st.session_state.get("offense_preview_df")
+                def_prev = st.session_state.get("defense_preview_df")
+                if off_prev is not None and not off_prev.empty and not season_off_wide.empty:
+                    st.session_state["offense_preview_df"] = _merge_nfl_avgs_into_preview(off_prev, season_off_wide)
+                    st.info("📊 Added NFL Avg columns to Offense preview.")
+                if def_prev is not None and not def_prev.empty and not season_def_wide.empty:
+                    st.session_state["defense_preview_df"] = _merge_nfl_avgs_into_preview(def_prev, season_def_wide)
+                    st.info("📊 Added NFL Avg columns to Defense preview.")
+
+            st.markdown("**Season NFL Averages (Quick Peek)**")
+            if not season_off_tbl.empty:
+                st.dataframe(season_off_tbl, use_container_width=True)
+            if not season_def_tbl.empty:
+                st.dataframe(season_def_tbl, use_container_width=True)
+            if not season_pbp_tbl.empty:
+                st.dataframe(season_pbp_tbl, use_container_width=True)
+
+            st.markdown("**Weekly NFL Averages (Quick Peek)**")
+            if not weekly_off_tbl.empty:
+                st.dataframe(weekly_off_tbl, use_container_width=True)
+            if not weekly_def_tbl.empty:
+                st.dataframe(weekly_def_tbl, use_container_width=True)
+            if not weekly_pbp_tbl.empty:
+                st.dataframe(weekly_pbp_tbl, use_container_width=True)
 # =========================
 # Helpers
 # =========================
