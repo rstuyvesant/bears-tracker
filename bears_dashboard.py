@@ -6,13 +6,13 @@ from fpdf import FPDF
 # ---------- Page Setup ----------
 st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
 st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
-st.markdown("Track weekly stats, strategy, personnel usage, previews, and league comparisons.")
+st.markdown("Track weekly stats, strategy, personnel usage, previews, league averages, and exports.")
 
 # Main Excel workbook
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
 
 # ---------- Utilities ----------
-def load_excel_sheet(file_name: str, sheet_name: str) -> pd.DataFrame:
+def load_excel_sheet(file_name, sheet_name):
     if not os.path.exists(file_name):
         return pd.DataFrame()
     try:
@@ -20,12 +20,11 @@ def load_excel_sheet(file_name: str, sheet_name: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def append_to_excel(new_df: pd.DataFrame, sheet_name: str, file_name: str = EXCEL_FILE,
-                    dedupe_cols: list[str] | None = None):
+def append_to_excel(new_df, sheet_name, file_name=EXCEL_FILE, dedupe_cols=None):
     """
     Append new_df to sheet `sheet_name` inside Excel `file_name`.
     - Creates file/sheet if missing.
-    - De-duplicates by dedupe_cols (if given), else drops exact dup rows.
+    - De-duplicates by dedupe_cols (if given), else drops exact duplicate rows.
     """
     if new_df is None or new_df.empty:
         return False, "Empty DataFrame — nothing to append."
@@ -34,13 +33,13 @@ def append_to_excel(new_df: pd.DataFrame, sheet_name: str, file_name: str = EXCE
     if "Week" in new_df.columns:
         new_df["Week"] = pd.to_numeric(new_df["Week"], errors="coerce").astype("Int64")
 
-    # Ensure file exists: create new workbook with this sheet
+    # Ensure file or create with this sheet
     if not os.path.exists(file_name):
         with pd.ExcelWriter(file_name, engine="openpyxl", mode="w") as writer:
             new_df.to_excel(writer, sheet_name=sheet_name, index=False)
         return True, "Created workbook and wrote first sheet."
 
-    # Read old data if sheet exists
+    # Read existing if present
     try:
         xl = pd.ExcelFile(file_name)
         old_df = pd.read_excel(file_name, sheet_name=sheet_name) if sheet_name in xl.sheet_names else pd.DataFrame()
@@ -69,11 +68,30 @@ def append_to_excel(new_df: pd.DataFrame, sheet_name: str, file_name: str = EXCE
     except Exception as e:
         return False, f"Write failed: {e}"
 
-# ---------- Sidebar ----------
+# ---------- Sidebar (Quick Actions) ----------
 with st.sidebar:
-    st.header("⚙️ Controls")
-    st.write("Use the sections to upload weekly data, compute NFL averages, and export.")
-    st.write(f"Excel file: **{EXCEL_FILE}**")
+    st.header("⚙️ Quick Actions")
+    st.write(f"Workbook: **{EXCEL_FILE}**")
+
+    run_compute_now = st.button("🧮 Compute NFL Averages (sidebar)")
+    st.session_state["trigger_compute_from_sidebar"] = bool(run_compute_now or st.session_state.get("trigger_compute_from_sidebar", False))
+
+    if os.path.exists(EXCEL_FILE):
+        with open(EXCEL_FILE, "rb") as f:
+            st.download_button("💾 Download All Data (Excel)", f, file_name=EXCEL_FILE, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.caption("No Excel yet — upload or compute to create it.")
+
+    st.markdown("---")
+    st.header("📂 Sections")
+    st.caption("This page renders in this order:")
+    st.write("• 📥 Uploads")
+    st.write("• 🧾 Previews")
+    st.write("• 📊 DVOA Proxy")
+    st.write("• 🧮 NFL Averages")
+    st.write("• 🎨 Color Settings")
+    st.write("• 🧾 PDF Exports")
+    st.write("• 💾 Export (bottom)")
 
 # =========================================================
 # 1) 📥 UPLOADS
@@ -145,6 +163,33 @@ if up_opp is not None:
     except Exception as e:
         st.error(f"Opponent Preview upload failed: {e}")
 
+# --- Injuries & Snap Counts ---
+col_ic1, col_ic2 = st.columns(2)
+
+with col_ic1:
+    st.subheader("Injuries")
+    up_inj = st.file_uploader("Upload Injuries CSV", type=["csv"], key="upload_inj")
+    if up_inj is not None:
+        try:
+            inj_df = pd.read_csv(up_inj)
+            st.dataframe(inj_df.head(20), use_container_width=True)
+            ok, msg = append_to_excel(inj_df, "Injuries", EXCEL_FILE, dedupe_cols=["Week", "Team", "Player"])
+            (st.success if ok else st.error)(msg)
+        except Exception as e:
+            st.error(f"Injuries upload failed: {e}")
+
+with col_ic2:
+    st.subheader("Snap Counts")
+    up_snap = st.file_uploader("Upload Snap Counts CSV", type=["csv"], key="upload_snap")
+    if up_snap is not None:
+        try:
+            snap_df = pd.read_csv(up_snap)
+            st.dataframe(snap_df.head(20), use_container_width=True)
+            ok, msg = append_to_excel(snap_df, "Snap_Counts", EXCEL_FILE, dedupe_cols=["Week", "Team", "Player"])
+            (st.success if ok else st.error)(msg)
+        except Exception as e:
+            st.error(f"Snap Counts upload failed: {e}")
+
 # =========================================================
 # 2) 🧾 PREVIEWS
 # =========================================================
@@ -170,12 +215,86 @@ with prev_col2:
     else:
         st.info("No Defense data yet.")
 
-# =========================================================
-# 3) 🧮 COMPUTE NFL AVERAGES (Season + Weekly) + Optional Merge
-# =========================================================
-EXCEL_PATH = EXCEL_FILE  # convenience alias
+ic_col1, ic_col2 = st.columns(2)
 
-def _find_candidate_sheets(file_path: str) -> dict:
+with ic_col1:
+    injuries_all = load_excel_sheet(EXCEL_FILE, "Injuries")
+    st.markdown("**Injuries (latest rows)**")
+    if not injuries_all.empty:
+        st.dataframe(injuries_all.tail(50).reset_index(drop=True), use_container_width=True)
+    else:
+        st.info("No Injuries data yet.")
+
+with ic_col2:
+    snaps_all = load_excel_sheet(EXCEL_FILE, "Snap_Counts")
+    st.markdown("**Snap Counts (latest rows)**")
+    if not snaps_all.empty:
+        st.dataframe(snaps_all.tail(50).reset_index(drop=True), use_container_width=True)
+    else:
+        st.info("No Snap Counts data yet.")
+
+# =========================================================
+# 3) 📊 DVOA PROXY (writes columns to Offense & Defense)
+# =========================================================
+st.markdown("## 📊 Compute DVOA Proxy")
+with st.expander("Add/refresh DVOA_Proxy_Off and DVOA_Proxy_Def in the workbook", expanded=False):
+
+    # Tunable weights (transparent, tweak as desired)
+    w_off = {
+        "YPA": 0.30, "CMP%": 0.20, "EPA/Play": 0.30, "3rd Down %": 0.10, "Red Zone %": 0.10,
+        "SACKs Allowed": -0.10, "INTs Thrown": -0.10, "Fumbles Lost": -0.05,
+    }
+    w_def = {
+        "SACKs": 0.25, "INTs": 0.20, "FF": 0.10, "FR": 0.05, "QB Hits": 0.05, "Pressures": 0.05,
+        "EPA/Play Allowed": -0.25, "Success Rate Allowed": -0.15,
+        "3D% Allowed": -0.10, "RZ% Allowed": -0.10, "YPA Allowed": -0.10, "YPC Allowed": -0.10, "CMP% Allowed": -0.10,
+    }
+
+    def _normalize(series):
+        s = pd.to_numeric(series, errors="coerce")
+        if s.dropna().empty:
+            return s
+        z = (s - s.mean()) / (s.std(ddof=0) if s.std(ddof=0) else 1.0)
+        return z.clip(-3, 3)
+
+    def _compute_proxy(df, weights):
+        if df is None or df.empty:
+            return pd.Series(dtype="float64")
+        score = pd.Series(0.0, index=df.index)
+        for col, w in weights.items():
+            if col in df.columns:
+                score = score + w * _normalize(df[col])
+        score = (score - score.mean()) / (score.std(ddof=0) if score.std(ddof=0) else 1.0)
+        return score * 8.0  # ~ -24..+24 range
+
+    if st.button("Compute & Save DVOA Proxies"):
+        off_all = load_excel_sheet(EXCEL_FILE, "Offense")
+        def_all = load_excel_sheet(EXCEL_FILE, "Defense")
+        if off_all.empty and def_all.empty:
+            st.warning("No Offense/Defense data yet.")
+        else:
+            if not off_all.empty:
+                off_all = off_all.copy()
+                off_all["DVOA_Proxy_Off"] = _compute_proxy(off_all, w_off)
+                ok, msg = append_to_excel(off_all, "Offense", EXCEL_FILE, dedupe_cols=["Week","Team","Opponent"])
+                (st.success if ok else st.error)(f"Offense: {msg}")
+                st.session_state["offense_preview_df"] = off_all.tail(30).reset_index(drop=True)
+
+            if not def_all.empty:
+                def_all = def_all.copy()
+                def_all["DVOA_Proxy_Def"] = _compute_proxy(def_all, w_def)
+                ok, msg = append_to_excel(def_all, "Defense", EXCEL_FILE, dedupe_cols=["Week","Team","Opponent"])
+                (st.success if ok else st.error)(f"Defense: {msg}")
+                st.session_state["defense_preview_df"] = def_all.tail(30).reset_index(drop=True)
+
+            st.info("DVOA proxies updated. Re-run **🧮 Compute NFL Averages** to refresh league means.")
+
+# =========================================================
+# 4) 🧮 COMPUTE NFL AVERAGES (Season + Weekly) + Optional Merge
+# =========================================================
+EXCEL_PATH = EXCEL_FILE  # alias
+
+def _find_candidate_sheets(file_path):
     dfs = {}
     if not os.path.exists(file_path):
         return dfs
@@ -195,13 +314,13 @@ def _find_candidate_sheets(file_path: str) -> dict:
         dfs[k] = pd.concat(v, ignore_index=True) if v else pd.DataFrame()
     return dfs
 
-def _select_metric_columns(df: pd.DataFrame, preferred_cols: list[str]) -> list[str]:
-    return [c for c in preferred_cols if c in df.columns]
+def _select_metric_columns(df, preferred_cols):
+    return [c for c in preferred_cols if isinstance(df, pd.DataFrame) and c in df.columns]
 
-def _numeric_columns(df: pd.DataFrame) -> list[str]:
+def _numeric_columns(df):
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
-def _clean_week(df: pd.DataFrame) -> pd.DataFrame:
+def _clean_week(df):
     wk = None
     for c in df.columns:
         if c.lower() in ["week", "wk", "game_week"]:
@@ -211,8 +330,8 @@ def _clean_week(df: pd.DataFrame) -> pd.DataFrame:
         df["Week"] = pd.to_numeric(df[wk], errors="coerce").astype("Int64")
     return df
 
-def _compute_avgs(df: pd.DataFrame, metrics: list[str]):
-    if df.empty or not metrics:
+def _compute_avgs(df, metrics):
+    if df is None or df.empty or not metrics:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df = _clean_week(df)
     season_avgs = df[metrics].mean(numeric_only=True)
@@ -222,16 +341,16 @@ def _compute_avgs(df: pd.DataFrame, metrics: list[str]):
     weekly = df.groupby("Week")[metrics].mean(numeric_only=True).reset_index() if "Week" in df.columns else pd.DataFrame()
     return season_table, weekly, season_wide
 
-def _write_nfl_averages_sheet(file_path: str,
-                              season_off: pd.DataFrame, weekly_off: pd.DataFrame,
-                              season_def: pd.DataFrame, weekly_def: pd.DataFrame,
-                              season_pbp: pd.DataFrame, weekly_pbp: pd.DataFrame):
+def _write_nfl_averages_sheet(file_path,
+                              season_off, weekly_off,
+                              season_def, weekly_def,
+                              season_pbp, weekly_pbp):
     mode = "a" if os.path.exists(file_path) else "w"
     with pd.ExcelWriter(file_path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
         idx_df = pd.DataFrame({"Section": ["GeneratedAt"], "Value": [pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")]})
         idx_df.to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=0)
 
-        def _dump(df: pd.DataFrame, startrow: int, title: str) -> int:
+        def _dump(df, startrow, title):
             pd.DataFrame({"Section": [title]}).to_excel(writer, sheet_name="NFL_Averages", index=False, startrow=startrow)
             startrow += 1
             if not df.empty:
@@ -250,7 +369,7 @@ def _write_nfl_averages_sheet(file_path: str,
         row = _dump(season_pbp, row, "Season Averages - PlayByPlay")
         row = _dump(weekly_pbp, row, "Weekly Averages - PlayByPlay")
 
-def _merge_nfl_avgs_into_preview(preview_df: pd.DataFrame, season_wide: pd.DataFrame) -> pd.DataFrame:
+def _merge_nfl_avgs_into_preview(preview_df, season_wide):
     if preview_df is None or preview_df.empty or season_wide.empty:
         return preview_df
     season_wide_broadcast = pd.concat([season_wide] * len(preview_df), ignore_index=True)
@@ -264,7 +383,12 @@ PREFERRED_PBP_METRICS = ["EPA","Succ","AirYards","YAC","WPA"]
 st.markdown("## 🧮 Compute NFL Averages")
 with st.expander("Compute NFL Averages (write to Excel and optionally merge into previews)", expanded=False):
     do_merge = st.checkbox("Also add “NFL Avg …” columns to my Offense/Defense preview tables", value=True)
-    if st.button("Compute & Save NFL Averages"):
+    clicked_main_compute = st.button("Compute & Save NFL Averages")
+
+    if clicked_main_compute or st.session_state.get("trigger_compute_from_sidebar"):
+        # reset sidebar trigger so it doesn't auto-run next time
+        st.session_state["trigger_compute_from_sidebar"] = False
+
         if not os.path.exists(EXCEL_PATH):
             st.error(f"Excel file not found: {EXCEL_PATH}")
         else:
@@ -291,7 +415,7 @@ with st.expander("Compute NFL Averages (write to Excel and optionally merge into
                 pbp_metrics = _numeric_columns(pbp_df)
             season_pbp_tbl, weekly_pbp_tbl, _ = _compute_avgs(pbp_df, pbp_metrics)
 
-            # Write NFL_Averages sheet
+            # Write the sheet
             try:
                 _write_nfl_averages_sheet(EXCEL_PATH,
                                           season_off_tbl, weekly_off_tbl,
@@ -301,7 +425,7 @@ with st.expander("Compute NFL Averages (write to Excel and optionally merge into
             except Exception as e:
                 st.error(f"Could not write NFL_Averages sheet: {e}")
 
-            # Save outputs to session (for colors/PDFs)
+            # Save for other widgets
             st.session_state["season_off_tbl"] = season_off_tbl
             st.session_state["season_def_tbl"] = season_def_tbl
             st.session_state["weekly_off_tbl"] = weekly_off_tbl
@@ -311,7 +435,7 @@ with st.expander("Compute NFL Averages (write to Excel and optionally merge into
             st.session_state["season_off_wide"] = season_off_wide
             st.session_state["season_def_wide"] = season_def_wide
 
-            # Optional: merge NFL Avg columns into previews
+            # Optional merge into previews
             if do_merge:
                 off_prev = st.session_state.get("offense_preview_df")
                 def_prev = st.session_state.get("defense_preview_df")
@@ -334,7 +458,7 @@ with st.expander("Compute NFL Averages (write to Excel and optionally merge into
             if not weekly_pbp_tbl.empty: st.dataframe(weekly_pbp_tbl, use_container_width=True)
 
 # =========================================================
-# 4) 🎨 COLOR THRESHOLDS
+# 5) 🎨 COLOR THRESHOLDS
 # =========================================================
 THRESHOLDS_OFF = {
     "YPA": (6.8, 7.8), "YPC": (4.0, 5.0), "CMP%": (62.0, 68.0), "QBR": (50.0, 65.0),
@@ -351,7 +475,7 @@ THRESHOLDS_DEF = {
     "DVOA": (5.0, -5.0), "DVOA_Proxy_Def": (5.0, -5.0),
 }
 
-def _style_thresholds(df: pd.DataFrame, thresholds: dict, invert_for_cols: set | None = None):
+def _style_thresholds(df, thresholds, invert_for_cols=None):
     invert_for_cols = invert_for_cols or set()
     styles = pd.DataFrame("", index=df.index, columns=df.columns)
 
@@ -393,7 +517,6 @@ with st.expander("Color thresholds for previews & weekly NFL tables", expanded=F
             st.dataframe(def_prev.style.apply(lambda _: _style_thresholds(def_prev, THRESHOLDS_DEF), axis=None),
                          use_container_width=True)
 
-        # Also style weekly league tables if present
         wk_off = st.session_state.get("weekly_off_tbl")
         wk_def = st.session_state.get("weekly_def_tbl")
 
@@ -406,7 +529,7 @@ with st.expander("Color thresholds for previews & weekly NFL tables", expanded=F
             st.dataframe(wk_def.style.apply(lambda _: _style_thresholds(wk_def, THRESHOLDS_DEF), axis=None), use_container_width=True)
 
 # =========================================================
-# 5) 🧾 PDF EXPORTS (colored)
+# 6) 🧾 PDF EXPORTS (colored)
 # =========================================================
 def _rgb_for_cell(value, low, high, higher_is_better=True):
     try:
@@ -525,7 +648,7 @@ with st.expander("Download colored PDFs (league tables & previews)", expanded=Fa
         st.info("Previews not found in session. Visit the preview sections (and enable NFL Avg merge) first.")
 
 # =========================================================
-# 6) 💾 EXPORT EXCEL
+# 7) 💾 EXPORT (bottom of page)
 # =========================================================
 st.markdown("## 💾 Export")
 if os.path.exists(EXCEL_FILE):
@@ -533,4 +656,3 @@ if os.path.exists(EXCEL_FILE):
         st.download_button("⬇️ Download All Data (Excel)", f, file_name=EXCEL_FILE, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("No Excel file yet. Upload something or compute averages to create it.")
-Sent from my iPad
