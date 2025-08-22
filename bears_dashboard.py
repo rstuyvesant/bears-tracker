@@ -2,6 +2,7 @@ import os
 import streamlit as st
 import pandas as pd
 from fpdf import FPDF
+from datetime import datetime
 
 # ---------- Page Setup ----------
 st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
@@ -11,7 +12,14 @@ st.markdown("Track weekly stats, strategy, personnel usage, previews, league ave
 # Main Excel workbook
 EXCEL_FILE = "bears_weekly_analytics.xlsx"
 
-# ---------- Utilities ----------
+# ---------- Helpers ----------
+def make_export_filename(week: int, phase: str, ext: str = "xlsx") -> str:
+    """
+    Standardized export filenames: W01_post_2025-08-21.xlsx / .pdf
+    """
+    today = datetime.today().strftime("%Y-%m-%d")
+    return f"W{week:02d}_{phase}_{today}.{ext}"
+
 def load_excel_sheet(file_name, sheet_name):
     if not os.path.exists(file_name):
         return pd.DataFrame()
@@ -68,17 +76,28 @@ def append_to_excel(new_df, sheet_name, file_name=EXCEL_FILE, dedupe_cols=None):
     except Exception as e:
         return False, f"Write failed: {e}"
 
-# ---------- Sidebar (Quick Actions) ----------
+# ---------- Sidebar (Quick Actions + Export Naming Controls) ----------
 with st.sidebar:
     st.header("⚙️ Quick Actions")
     st.write(f"Workbook: **{EXCEL_FILE}**")
 
+    # Week/Phase controls shared by sidebar quick download + PDF section + bottom export
+    week_num_global = st.number_input("Week #", min_value=1, max_value=18, value=1)
+    phase_global = st.selectbox("Phase", ["pre", "post", "final"])
+
+    # Quick compute
     run_compute_now = st.button("🧮 Compute NFL Averages (sidebar)")
     st.session_state["trigger_compute_from_sidebar"] = bool(run_compute_now or st.session_state.get("trigger_compute_from_sidebar", False))
 
-    if os.path.exists(EXCEL_FILE):
+    # Quick Excel download with auto filename
+    if os.path_exists := os.path.exists(EXCEL_FILE):
         with open(EXCEL_FILE, "rb") as f:
-            st.download_button("💾 Download All Data (Excel)", f, file_name=EXCEL_FILE, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "💾 Download All Data (Excel)",
+                data=f.read(),
+                file_name=make_export_filename(int(week_num_global), phase_global, "xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
     else:
         st.caption("No Excel yet — upload or compute to create it.")
 
@@ -529,7 +548,7 @@ with st.expander("Color thresholds for previews & weekly NFL tables", expanded=F
             st.dataframe(wk_def.style.apply(lambda _: _style_thresholds(wk_def, THRESHOLDS_DEF), axis=None), use_container_width=True)
 
 # =========================================================
-# 6) 🧾 PDF EXPORTS (colored)
+# 6) 🧾 PDF EXPORTS (colored, auto-named)
 # =========================================================
 def _rgb_for_cell(value, low, high, higher_is_better=True):
     try:
@@ -605,22 +624,28 @@ def _export_pdf(filename, tables):
 
 st.markdown("## 🧾 PDF Exports")
 with st.expander("Download colored PDFs (league tables & previews)", expanded=False):
+    # Use the same week/phase picked in the sidebar for consistency
+    wk = int(st.session_state.get("week_num_global", 0) or week_num_global)
+    ph = st.session_state.get("phase_global", "") or phase_global
+
+    st.caption(f"Using Week {wk} — Phase '{ph}' for file names (change in sidebar).")
+
     wk_off = st.session_state.get("weekly_off_tbl")
     wk_def = st.session_state.get("weekly_def_tbl")
 
     if isinstance(wk_off, pd.DataFrame) and not wk_off.empty:
-        pdf_path = "NFL_Averages_Weekly.pdf"
         if st.button("📥 Download NFL Averages (PDF)"):
             try:
+                fname = make_export_filename(wk, ph, "pdf")
                 _export_pdf(
-                    pdf_path,
+                    fname,
                     [
-                        {"title": "Weekly NFL Averages – Offense", "df": wk_off, "thresholds": THRESHOLDS_OFF, "include_week": True},
-                        {"title": "Weekly NFL Averages – Defense", "df": wk_def if isinstance(wk_def, pd.DataFrame) else pd.DataFrame(), "thresholds": THRESHOLDS_DEF, "include_week": True},
+                        {"title": f"Weekly NFL Averages – Offense (W{wk:02d}, {ph})", "df": wk_off, "thresholds": THRESHOLDS_OFF, "include_week": True},
+                        {"title": f"Weekly NFL Averages – Defense (W{wk:02d}, {ph})", "df": wk_def if isinstance(wk_def, pd.DataFrame) else pd.DataFrame(), "thresholds": THRESHOLDS_DEF, "include_week": True},
                     ],
                 )
-                with open(pdf_path, "rb") as f:
-                    st.download_button("Download NFL Averages (PDF)", f, file_name=pdf_path, mime="application/pdf")
+                with open(fname, "rb") as f:
+                    st.download_button(f"Download {fname}", f.read(), file_name=fname, mime="application/pdf")
             except Exception as e:
                 st.error(f"PDF export failed: {e}")
     else:
@@ -630,29 +655,40 @@ with st.expander("Download colored PDFs (league tables & previews)", expanded=Fa
     def_prev = st.session_state.get("defense_preview_df")
 
     if isinstance(off_prev, pd.DataFrame) and not off_prev.empty:
-        pdf_prev_path = "Bears_vs_NFL_Previews.pdf"
         if st.button("📥 Download Bears vs NFL Previews (PDF)"):
             try:
+                fname_prev = make_export_filename(wk, ph, "pdf").replace(".pdf", "_previews.pdf")
                 _export_pdf(
-                    pdf_prev_path,
+                    fname_prev,
                     [
-                        {"title": "Bears Offense Preview (with NFL Avg columns)", "df": off_prev, "thresholds": THRESHOLDS_OFF, "include_week": False},
-                        {"title": "Bears Defense Preview (with NFL Avg columns)", "df": def_prev if isinstance(def_prev, pd.DataFrame) else pd.DataFrame(), "thresholds": THRESHOLDS_DEF, "include_week": False},
+                        {"title": f"Bears Offense Preview (W{wk:02d}, {ph})", "df": off_prev, "thresholds": THRESHOLDS_OFF, "include_week": False},
+                        {"title": f"Bears Defense Preview (W{wk:02d}, {ph})", "df": def_prev if isinstance(def_prev, pd.DataFrame) else pd.DataFrame(), "thresholds": THRESHOLDS_DEF, "include_week": False},
                     ],
                 )
-                with open(pdf_prev_path, "rb") as f:
-                    st.download_button("Download Bears vs NFL Previews (PDF)", f, file_name=pdf_prev_path, mime="application/pdf")
+                with open(fname_prev, "rb") as f:
+                    st.download_button(f"Download {fname_prev}", f.read(), file_name=fname_prev, mime="application/pdf")
             except Exception as e:
                 st.error(f"PDF export failed: {e}")
     else:
         st.info("Previews not found in session. Visit the preview sections (and enable NFL Avg merge) first.")
 
 # =========================================================
-# 7) 💾 EXPORT (bottom of page)
+# 7) 💾 EXPORT (bottom of page, auto-named)
 # =========================================================
 st.markdown("## 💾 Export")
+wk = int(st.session_state.get("week_num_global", 0) or week_num_global)
+ph = st.session_state.get("phase_global", "") or phase_global
+
 if os.path.exists(EXCEL_FILE):
-    with open(EXCEL_FILE, "rb") as f:
-        st.download_button("⬇️ Download All Data (Excel)", f, file_name=EXCEL_FILE, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    try:
+        with open(EXCEL_FILE, "rb") as f:
+            st.download_button(
+                "⬇️ Download All Data (Excel)",
+                data=f.read(),
+                file_name=make_export_filename(wk, ph, "xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    except Exception as e:
+        st.error(f"Export failed: {e}")
 else:
     st.info("No Excel file yet. Upload something or compute averages to create it.")
