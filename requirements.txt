@@ -5,3 +5,4 @@ fpdf
 nfl_data_py
 pyarrow
 fastparquet
+reportlab
