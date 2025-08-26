@@ -165,17 +165,25 @@ def _merge_team_vs_nfl(team_df: pd.DataFrame, nfl_df: pd.DataFrame, as_metrics=T
         })
     return pd.DataFrame(out)
 
-def _colorize_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+# OLD (problematic)
+# def _colorize_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+
+# NEW (safe)
+def _colorize_df(df: pd.DataFrame):
     """Color Team vs NFL columns based on better/worse per METRIC_SCHEMA."""
-    if df is None or df.empty:
+    if df is None or getattr(df, "empty", True):
         return df
+    # If Styler isn't available for any reason, just return the raw df (no colors)
+    if not hasattr(df, "style"):
+        return df
+
     def _color_row(row):
         bg = []
         for col in df.columns:
             if col == "Metric":
                 bg.append("")
                 continue
-            metric = row["Metric"]
+            metric = row.get("Metric")
             info = METRIC_SCHEMA.get(metric, {"higher_is_better": True})
             higher = info["higher_is_better"]
             team = row.get("Team")
@@ -187,6 +195,7 @@ def _colorize_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             else:
                 bg.append("")
         return bg
+
     return df.style.apply(_color_row, axis=1)
 
 def _apply_excel_conditional_formatting(ws, first_data_row: int, team_col_letter: str, nfl_col_letter: str, last_row: int):
