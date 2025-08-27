@@ -1,7 +1,7 @@
 # bears_dashboard.py
 # Chicago Bears 2025–26 Weekly Tracker (Streamlit)
-# Full app with NFL tools, uploads, proxy, media/injuries/opponent preview, predictions,
-# YTD Team vs NFL Avg (colorized), weekly previews, and Pre/Post/Final Excel/PDF exports.
+# Full app with NFL tools (manual + auto fetch), uploads, proxy, media/injuries/opponent preview,
+# predictions, YTD Team vs NFL Avg (colorized), weekly previews, and Pre/Post/Final Excel/PDF exports.
 
 import os
 from datetime import datetime
@@ -68,7 +68,25 @@ def _read_sheet(name: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# --- Backward-compat shim ---
+def _write_sheet(name: str, df: pd.DataFrame):
+    _ensure_excel()
+    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+        df.to_excel(w, sheet_name=name, index=False)
+
+def _append_df(sheet_name: str, df_new: pd.DataFrame, key_cols=None):
+    _ensure_excel()
+    if df_new is None or df_new.empty:
+        return
+    df_old = _read_sheet(sheet_name)
+    if df_old is None or df_old.empty:
+        df_out = df_new.copy()
+    else:
+        df_out = pd.concat([df_old, df_new], ignore_index=True)
+    if key_cols:
+        df_out = df_out.drop_duplicates(subset=key_cols, keep="last")
+    _write_sheet(sheet_name, df_out)
+
+# --- Backward-compat shim (in case older code calls these) ---
 SHEETS = {
     "Offense": "Offense",
     "Defense": "Defense",
@@ -87,24 +105,6 @@ SHEETS = {
 def _load_sheet(name: str) -> pd.DataFrame:
     return _read_sheet(name)
 # --- End shim ---
-
-def _write_sheet(name: str, df: pd.DataFrame):
-    _ensure_excel()
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-        df.to_excel(w, sheet_name=name, index=False)
-
-def _append_df(sheet_name: str, df_new: pd.DataFrame, key_cols=None):
-    _ensure_excel()
-    if df_new is None or df_new.empty:
-        return
-    df_old = _read_sheet(sheet_name)
-    if df_old is None or df_old.empty:
-        df_out = df_new.copy()
-    else:
-        df_out = pd.concat([df_old, df_new], ignore_index=True)
-    if key_cols:
-        df_out = df_out.drop_duplicates(subset=key_cols, keep="last")
-    _write_sheet(sheet_name, df_out)
 
 # ========= Utility / Computation =========
 def _calc_proxy(off_row: pd.Series=None, def_row: pd.Series=None) -> float | None:
@@ -222,34 +222,188 @@ def _export_pdf_weekly(filename: str, header: str, notes: str,
     doc.build(story)
     return True, "ok"
 
+# ========= NFL Auto-Fetch (nfl_data_py) =========
+def _fetch_nfl_data_and_build_avgs(season: int, thru_week: int) -> tuple[bool, str]:
+    """
+    Tries to fetch weekly team stats with nfl_data_py and compute league averages
+    for the METRIC_SCHEMA. Any metric with missing columns is left NaN.
+    Saves result to NFL_Averages_Manual (preferred by the UI).
+    """
+    try:
+        import nfl_data_py as nfl
+    except Exception as e:
+        return False, f"'nfl_data_py' not available: {e}"
+
+    # Try a few likely functions; tolerate differences across versions
+    weekly = None
+    errors = []
+    for fn_name in ["import_weekly_data", "import_weekly_team_stats", "load_weekly", "import_season_team_stats"]:
+        try:
+            fn = getattr(nfl, fn_name)
+        except Exception as e:
+            errors.append(f"{fn_name}: {e}")
+            continue
+        try:
+            # Many nfl_data_py funcs expect a list of seasons
+            arg = [season] if fn_name != "load_weekly" else season
+            weekly = fn(arg)
+            break
+        except Exception as e:
+            errors.append(f"{fn_name} failed: {e}")
+            weekly = None
+
+    if weekly is None or weekly is False or (hasattr(weekly, "empty") and weekly.empty):
+        return False, "Could not fetch weekly NFL data via nfl_data_py. " + ("; ".join(errors) if errors else "")
+
+    # Filter to thru_week if 'week' column exists
+    if "week" in weekly.columns:
+        try:
+            weekly = weekly[weekly["week"].astype(int).between(1, int(thru_week))]
+        except Exception:
+            pass
+
+    # Helper to find a best-guess column
+    def pick(df, *cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+
+    # Compute offense-like league averages (per-play/percentage)
+    # Try multiple common column names to be robust.
+    out = {m: None for m in METRIC_SCHEMA.keys()}
+
+    # YPA = pass_yards / pass_attempts
+    yards_col = pick(weekly, "pass_yards", "passing_yards", "pass_yds", "yards_gained_pass")
+    atts_col  = pick(weekly, "pass_attempts", "attempts", "att", "pass_att")
+    if yards_col and atts_col:
+        try:
+            ypa = weekly[yards_col].sum() / max(1, weekly[atts_col].sum())
+            out["YPA"] = float(round(ypa, 3))
+        except Exception:
+            pass
+
+    # CMP% = completions / attempts
+    comp_col = pick(weekly, "completions", "complete_pass", "cmp", "pass_completions")
+    if comp_col and atts_col:
+        try:
+            cmp_pct = (weekly[comp_col].sum() / max(1, weekly[atts_col].sum())) * 100.0
+            out["CMP%"] = float(round(cmp_pct, 2))
+        except Exception:
+            pass
+
+    # SACKs (sum if present)
+    sacks_col = pick(weekly, "sacks", "qb_sacks", "sack")
+    if sacks_col:
+        try:
+            out["SACKs"] = float(round(weekly[sacks_col].mean(), 3))  # per team average
+        except Exception:
+            pass
+
+    # INTs (sum if present) - ambiguous (thrown vs made); we take per-team average of 'interceptions' if present
+    ints_col = pick(weekly, "interceptions", "int", "def_interceptions", "interceptions_thrown")
+    if ints_col:
+        try:
+            out["INTs"] = float(round(weekly[ints_col].mean(), 3))
+        except Exception:
+            pass
+
+    # QB Hits, Pressures — only if such columns exist
+    qbh_col = pick(weekly, "qb_hits", "qb_hit", "qb_hits_defense")
+    if qbh_col:
+        try:
+            out["QB Hits"] = float(round(weekly[qbh_col].mean(), 3))
+        except Exception:
+            pass
+
+    prs_col = pick(weekly, "pressures", "pressure", "qb_pressures")
+    if prs_col:
+        try:
+            out["Pressures"] = float(round(weekly[prs_col].mean(), 3))
+        except Exception:
+            pass
+
+    # 3D% Allowed & RZ% Allowed — typically not present in standard team weekly tables;
+    # leave as None unless recognizable columns exist.
+    thrd_made = pick(weekly, "third_down_conversions", "third_downs_made", "third_down_success")
+    thrd_att  = pick(weekly, "third_down_attempts", "third_downs", "third_down_att")
+    if thrd_made and thrd_att:
+        try:
+            out["3D% Allowed"] = None   # we don't have DEF allowed; keeping OFF 3D% separate would mislead
+        except Exception:
+            pass
+
+    rz_made = pick(weekly, "redzone_td_made", "red_zone_td", "rz_td")
+    rz_att  = pick(weekly, "redzone_td_att", "red_zone_att", "rz_att")
+    if rz_made and rz_att:
+        try:
+            out["RZ% Allowed"] = None   # same reasoning as above (need defensive allowed)
+        except Exception:
+            pass
+
+    # Build a 1-row manual NFL table with columns named exactly like METRIC_SCHEMA
+    manual_row = {k: out.get(k) for k in METRIC_SCHEMA.keys()}
+    manual_df = pd.DataFrame([manual_row])
+
+    # Save to manual sheet (preferred by UI)
+    _write_sheet("NFL_Averages_Manual", manual_df)
+
+    # Also stash the raw fetch (for debugging/mapping)
+    try:
+        _write_sheet("NFL_Raw_Fetch", weekly)
+    except Exception:
+        pass
+
+    # Report how many metrics we filled
+    filled = sum(v is not None for v in manual_row.values())
+    return True, f"Fetched season {season} up to week {thru_week}. Filled {filled}/{len(METRIC_SCHEMA)} metrics."
+
 # ========= Sidebar (NFL tools) =========
 with st.sidebar:
     st.header("NFL Tools")
-    st.caption("Upload manual league averages or compute from your uploads.")
+    st.caption("Upload manual league averages, auto-fetch via nfl_data_py, or compute from uploads.")
+
+    # Manual upload
     nfl_avgs_file = st.file_uploader("Upload Manual NFL Averages (CSV)", type=["csv"], key="nfl_avg_upload")
+
     col_sb1, col_sb2 = st.columns(2)
+    col_sb3, col_sb4 = st.columns(2)
+
     if nfl_avgs_file:
         try:
             nfl_avgs_df = pd.read_csv(nfl_avgs_file)
+            # Keep only known metrics columns if present; otherwise write raw (we only read known names anyway)
+            known = [c for c in nfl_avgs_df.columns if c in METRIC_SCHEMA.keys()]
+            if known:
+                nfl_avgs_df = nfl_avgs_df[known]
             _write_sheet("NFL_Averages_Manual", nfl_avgs_df)
             st.success("Manual NFL averages saved → sheet: NFL_Averages_Manual")
         except Exception as e:
             st.error(f"Failed to load NFL averages: {e}")
+
+    # Auto fetch
     with col_sb1:
-        if st.button("Recompute NFL Averages (from uploads)"):
-            # recompute YTD NFL offense/defense from your uploaded Offense/Defense, all weeks so far
-            off_all = _read_sheet("Offense"); def_all = _read_sheet("Defense")
-            if off_all.empty and def_all.empty:
-                st.warning("Upload Offense/Defense first.")
-            else:
-                # Save numeric-only YTD as a league proxy sheets (will be filtered by week in display)
-                _write_sheet("YTD_NFL_Offense", off_all.select_dtypes(include="number"))
-                _write_sheet("YTD_NFL_Defense", def_all.select_dtypes(include="number"))
-                st.success("Recomputed NFL averages from uploads (numeric columns).")
+        fetch_season = st.number_input("Fetch Season", min_value=2000, max_value=2100, value=datetime.now().year)
     with col_sb2:
+        fetch_week = st.number_input("Through Week", min_value=1, max_value=25, value=1, step=1)
+    with col_sb3:
+        if st.button("Fetch NFL Data (Auto)"):
+            ok, msg = _fetch_nfl_data_and_build_avgs(int(fetch_season), int(fetch_week))
+            (st.success if ok else st.warning)(msg)
+    with col_sb4:
         if st.button("Clear Manual NFL Averages"):
             _write_sheet("NFL_Averages_Manual", pd.DataFrame())
             st.success("Manual NFL averages cleared.")
+
+    st.divider()
+    if st.button("Recompute NFL Averages (from uploads)"):
+        off_all = _read_sheet("Offense"); def_all = _read_sheet("Defense")
+        if off_all.empty and def_all.empty:
+            st.warning("Upload Offense/Defense first.")
+        else:
+            _write_sheet("YTD_NFL_Offense", off_all.select_dtypes(include="number"))
+            _write_sheet("YTD_NFL_Defense", def_all.select_dtypes(include="number"))
+            st.success("Recomputed NFL averages from uploads (numeric columns).")
 
     st.divider()
     if st.button("Download All Data (Excel)"):
@@ -383,16 +537,16 @@ pred_all = _read_sheet("Predictions")
 if not pred_all.empty:
     st.dataframe(pred_all.sort_values("Week"), use_container_width=True, hide_index=True)
 
-# ========= YTD Summary (Team vs NFL Avg) =========
+# ========= 6) YTD Summary (Team vs NFL Avg) =========
 st.markdown("### 6) YTD Summary (Auto-computed from uploads)")
 off_ytd_team = _ytd(off_df_all, selected_week)
 def_ytd_team = _ytd(def_df_all, selected_week)
 
-# NFL average source: prefer Manual sheet if present; else use uploads proxy; both filtered to YTD.
+# NFL average source: prefer Manual sheet (including auto-fetched) if present; else use uploads proxy; both filtered to YTD.
 nfl_manual = _read_sheet("NFL_Averages_Manual")
 if not nfl_manual.empty:
-    nfl_off = nfl_manual.select_dtypes(include="number")
-    nfl_def = nfl_manual.select_dtypes(include="number")
+    nfl_off = nfl_manual  # already in metric-name columns
+    nfl_def = nfl_manual
 else:
     nfl_off_full = _read_sheet("YTD_NFL_Offense")
     nfl_def_full = _read_sheet("YTD_NFL_Defense")
@@ -450,7 +604,8 @@ def _export_excel(tag: str):
                 first_data_row = 2
                 last_row = ws.max_row
                 if last_row >= first_data_row and "YPA" in headers:
-                    team_col_letter = openpyxl.utils.get_column_letter(headers.index("YPA")+1)
+                    from openpyxl.utils import get_column_letter
+                    team_col_letter = get_column_letter(headers.index("YPA")+1)
                     _apply_excel_conditional(ws, first_data_row, team_col_letter, last_row)
         out_name = f"W{int(selected_week):02d}_{tag}.xlsx"
         wb.save(out_name)
@@ -468,6 +623,7 @@ def _export_pdf(tag: str):
     try:
         out_name = f"W{int(selected_week):02d}_{tag}.pdf"
         header = f"Week {selected_week}: {selected_team} vs {opponent}"
+        # Build tables again off current sources
         off_tbl = _team_vs_nfl_table(off_ytd_team, nfl_off)
         def_tbl = _team_vs_nfl_table(def_ytd_team, nfl_def)
         ok, msg = _export_pdf_weekly(out_name, header, key_notes, off_tbl, def_tbl)
@@ -503,5 +659,6 @@ with e6:
         _export_pdf("Final")
 
 st.caption("Tip: If PDF export says reportlab is missing, add `reportlab` to requirements.txt in the repo root, commit, push, then Manage app → Reboot/Rerun.")
+
 
 
