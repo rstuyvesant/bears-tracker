@@ -1,6 +1,7 @@
-sstreamlit
+streamlit
 pandas
 numpy
 openpyxl
-fpdf
 nfl_data_py
+# reportlab    # OPTIONAL: only add if you want PDF exports to work server-side.
+               # If you add it and see build errors on Python 3.13, leave it commented out.
