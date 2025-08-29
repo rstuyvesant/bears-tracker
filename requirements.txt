@@ -1,8 +1,6 @@
-streamlit
+sstreamlit
 pandas
+numpy
 openpyxl
 fpdf
 nfl_data_py
-pyarrow
-fastparquet
-reportlab
