@@ -1,413 +1,271 @@
-# bears_dashboard.py
-# Restores Pre-Export and Final buttons, keeps "Export Weekly Final PDF"
-# Compact, drop-in, and compatible with your existing weekly workflow.
+﻿## bears_dashboard.py
+# Simple Bears Weekly Tracker (NO Pre/Final/PDF exports)
 
-import os
-import io
-import datetime as dt
+from pathlib import Path
 import pandas as pd
+import numpy as np
 import streamlit as st
 
-# Optional PDF deps (graceful fallback to TXT if missing)
-try:
-    from reportlab.lib.pagesizes import LETTER
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
-    REPORTLAB_AVAILABLE = True
-except Exception:
-    REPORTLAB_AVAILABLE = False
+# ----------------------------
+# App basics
+# ----------------------------
+st.set_page_config(page_title="Bears Weekly Tracker", layout="wide")
+st.title("Bears Weekly Tracker (Simple)")
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
-st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
-st.caption("Pre + Final exports restored • Works with your current weekly flow")
+BASE_DIR = Path(__file__).parent.resolve()
+DATA_DIR = BASE_DIR / "data"
+MASTER_XLSX = DATA_DIR / "bears_weekly_analytics.xlsx"
 
-# --- CONSTANTS ---
-EXCEL_FILE = "bears_weekly_analytics.xlsx"  # your main workbook
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 SHEETS = {
     "offense": "Offense",
     "defense": "Defense",
     "personnel": "Personnel",
-    "snap_counts": "Snap_Counts",
-    "injuries": "Injuries",
-    "media": "Media_Summaries",
-    "opponent": "Opponent_Preview",
+    "snap": "Snap_Counts",
+    "inj": "Injuries",
+    "media": "Media",
+    "opp": "Opponent_Preview",
     "pred": "Predictions",
-    "nfl_manual": "NFL_Averages_Manual",
-    "nfl_off": "YTD_NFL_Offense",
-    "nfl_def": "YTD_NFL_Defense",
+    "notes": "Weekly_Notes",
 }
 
-# ---------- UTILITIES ----------
-def _ensure_excel(file_name: str):
-    if not os.path.exists(file_name):
-        with pd.ExcelWriter(file_name, engine="openpyxl") as writer:
-            # initialize all expected sheets empty (header-only)
-            for s in SHEETS.values():
-                pd.DataFrame().to_excel(writer, sheet_name=s, index=False)
+NFL_TEAMS = [
+    "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB","HOU","IND",
+    "JAX","KC","LAC","LAR","LV","MIA","MIN","NE","NO","NYG","NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
+]
+def week_options():
+    return [f"W{str(i).zfill(2)}" for i in range(1, 24)]
 
-def _load_sheet(sheet_name: str) -> pd.DataFrame:
-    _ensure_excel(EXCEL_FILE)
+# ----------------------------
+# Excel helpers
+# ----------------------------
+def ensure_master():
+    if MASTER_XLSX.exists():
+        return
+    with pd.ExcelWriter(MASTER_XLSX, engine="openpyxl", mode="w") as w:
+        pd.DataFrame(columns=["Week","Opponent"]).to_excel(w, index=False, sheet_name=SHEETS["offense"])
+        pd.DataFrame(columns=["Week","Opponent"]).to_excel(w, index=False, sheet_name=SHEETS["defense"])
+        pd.DataFrame(columns=["Week","Opponent","11","12","13","21","Other"]).to_excel(w, index=False, sheet_name=SHEETS["personnel"])
+        pd.DataFrame(columns=["Week","Opponent","Player","Snaps","Snap%","Side"]).to_excel(w, index=False, sheet_name=SHEETS["snap"])
+        pd.DataFrame(columns=["Week","Opponent","Player","Status","BodyPart","Practice","GameStatus","Notes"]).to_excel(w, index=False, sheet_name=SHEETS["inj"])
+        pd.DataFrame(columns=["Week","Opponent","Source","Summary"]).to_excel(w, index=False, sheet_name=SHEETS["media"])
+        pd.DataFrame(columns=["Week","Opponent","Off_Summary","Def_Summary","Matchups"]).to_excel(w, index=False, sheet_name=SHEETS["opp"])
+        pd.DataFrame(columns=["Week","Opponent","Predicted_Winner","Confidence","Rationale"]).to_excel(w, index=False, sheet_name=SHEETS["pred"])
+        pd.DataFrame(columns=["Week","Opponent","Notes"]).to_excel(w, index=False, sheet_name=SHEETS["notes"])
+
+def read_sheet(name):
+    ensure_master()
     try:
-        df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
-        # Normalize empty -> 0 rows DataFrame with no NaN column names
-        if df.empty:
-            return pd.DataFrame()
-        df.columns = [str(c) for c in df.columns]
-        return df
+        return pd.read_excel(MASTER_XLSX, sheet_name=name)
     except Exception:
         return pd.DataFrame()
 
-def _append_rows(df_new: pd.DataFrame, sheet_name: str, dedupe_on=None):
-    _ensure_excel(EXCEL_FILE)
-    df_old = _load_sheet(sheet_name)
-    if df_old.empty:
-        df_out = df_new.copy()
-    else:
-        df_out = pd.concat([df_old, df_new], ignore_index=True)
+def write_sheet(df, name):
+    ensure_master()
+    with pd.ExcelWriter(MASTER_XLSX, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+        (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=name)
 
-    # optional dedupe
-    if dedupe_on and set(dedupe_on).issubset(df_out.columns):
-        df_out = df_out.drop_duplicates(subset=dedupe_on, keep="last")
+def append_to_sheet(new_rows, name, dedup_cols=None):
+    old = read_sheet(name)
+    combined = pd.concat([old, new_rows], ignore_index=True)
+    if dedup_cols and all(c in combined.columns for c in dedup_cols):
+        combined = combined.drop_duplicates(subset=dedup_cols, keep="last").reset_index(drop=True)
+    write_sheet(combined, name)
 
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df_out.to_excel(writer, sheet_name=sheet_name, index=False)
-
-def _week_code(week: int) -> str:
-    # W01, W02, ...
-    return f"W{int(week):02d}"
-
-def _now_str() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-def _pdf_from_sections(title: str, week: int, opponent: str, blocks: list) -> bytes:
-    """
-    Generate a simple, reliable PDF using reportlab if available, else return txt bytes.
-    blocks: list of tuples (section_title, df_or_text)
-    """
-    if not REPORTLAB_AVAILABLE:
-        # Fallback TXT so you can still download something if reportlab isn't present.
-        text = [f"{title}",
-                f"Week: {week} ({_week_code(week)})",
-                f"Opponent: {opponent}",
-                f"Generated: {_now_str()}",
-                "-"*60]
-        for head, data in blocks:
-            text.append(f"\n[{head}]")
-            if isinstance(data, pd.DataFrame) and not data.empty:
-                text.append(data.to_string(index=False))
-            elif isinstance(data, pd.DataFrame) and data.empty:
-                text.append("(no data)")
-            else:
-                text.append(str(data) if data else "(no data)")
-        txt = "\n".join(text)
-        return txt.encode("utf-8")
-
-    # PDF path
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
-    left = 0.75 * inch
-    top = height - 0.75 * inch
-    y = top
-
-    def draw_line(s, font="Helvetica", size=10, leading=12):
-        nonlocal y
-        c.setFont(font, size)
-        for line in s.splitlines() if isinstance(s, str) else [str(s)]:
-            if y < 1 * inch:
-                c.showPage()
-                y = top
-                c.setFont(font, size)
-            c.drawString(left, y, line)
-            y -= leading
-
-    # Header
-    draw_line(title, "Helvetica-Bold", 14, 18)
-    draw_line(f"Week: {week} ({_week_code(week)})", "Helvetica", 10, 14)
-    draw_line(f"Opponent: {opponent}", "Helvetica", 10, 14)
-    draw_line(f"Generated: {_now_str()}", "Helvetica-Oblique", 9, 12)
-    draw_line("-" * 90, "Helvetica", 10, 12)
-
-    # Body
-    for head, data in blocks:
-        draw_line(f"[{head}]", "Helvetica-Bold", 11, 14)
-        if isinstance(data, pd.DataFrame):
-            if data.empty:
-                draw_line("(no data)")
-            else:
-                # Render DataFrame as text table
-                draw_line(" | ".join(data.columns))
-                for _, row in data.iterrows():
-                    draw_line(" | ".join([str(x) for x in row.values]))
-        else:
-            draw_line(str(data) if data else "(no data)")
-        draw_line("")  # spacer
-
-    c.save()
-    buf.seek(0)
-    return buf.read()
-
-def _gather_week_blocks(week: int) -> list:
-    """Collects key sections for the exports."""
-    wk = int(week)
-    wk_col = "Week"  # assumed column present across weekly tables
-
-    # pull data
-    offense = _load_sheet(SHEETS["offense"])
-    defense = _load_sheet(SHEETS["defense"])
-    personnel = _load_sheet(SHEETS["personnel"])
-    snaps = _load_sheet(SHEETS["snap_counts"])
-    injuries = _load_sheet(SHEETS["injuries"])
-    media = _load_sheet(SHEETS["media"])
-    opp = _load_sheet(SHEETS["opponent"])
-    pred = _load_sheet(SHEETS["pred"])
-
-    # filter by week if column present
-    def f(df):
-        return df[df[wk_col] == wk] if (not df.empty and wk_col in df.columns) else df
-
-    offense_w = f(offense)
-    defense_w = f(defense)
-    personnel_w = f(personnel)
-    snaps_w = f(snaps)
-    injuries_w = f(injuries)
-    media_w = f(media)
-    opp_w = f(opp)
-    pred_w = f(pred)
-
-    return [
-        ("Opponent Preview", opp_w),
-        ("Key Injuries", injuries_w),
-        ("Offense (weekly rows)", offense_w),
-        ("Defense (weekly rows)", defense_w),
-        ("Personnel Usage", personnel_w),
-        ("Snap Counts", snaps_w),
-        ("Media Summaries", media_w),
-        ("Predictions", pred_w),
-    ]
-
-def _opponent_for_week(week: int) -> str:
-    df = _load_sheet(SHEETS["opponent"])
-    if not df.empty:
-        wk_col = "Week"
-        opp_col = "Opponent"
-        if wk_col in df.columns and opp_col in df.columns:
-            row = df[df[wk_col] == int(week)]
-            if not row.empty:
-                return str(row.iloc[0][opp_col])
-    return ""
-
-# ---------- SIDEBAR ----------
+# ----------------------------
+# Sidebar controls
+# ----------------------------
 with st.sidebar:
-    st.header("League Data & Utilities")
-    st.write("These are independent of the weekly center sections.")
+    st.header("Weekly Controls")
+    week = st.selectbox("Week", week_options(), index=0)
+    opponent = st.selectbox("Opponent", NFL_TEAMS, index=NFL_TEAMS.index("MIN") if "MIN" in NFL_TEAMS else 0)
 
-    # (Placeholder) Fetch NFL Data (Auto)
-    # Keep as a stub so it doesn't break your current workflow
-    if st.button("Fetch NFL Data (Auto)"):
-        st.success("Fetched/updated league data (placeholder).")
-
-    # Download all data (Excel)
-    if os.path.exists(EXCEL_FILE):
-        with open(EXCEL_FILE, "rb") as f:
+    st.markdown("---")
+    st.subheader("Download Master (optional)")
+    if MASTER_XLSX.exists():
+        with open(MASTER_XLSX, "rb") as f:
             st.download_button(
-                "Download All Data (Excel)",
+                "Download Master Excel",
                 data=f.read(),
-                file_name=EXCEL_FILE,
+                file_name="bears_weekly_analytics.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
     else:
-        st.info("No Excel yet — it will be created as you save data.")
+        st.caption("Master workbook will be created the first time you save something.")
 
-# ---------- WEEKLY CONTROLS ----------
-st.subheader("Weekly Controls")
-colA, colB, colC = st.columns([1,1,2])
-with colA:
-    week = st.number_input("Week", min_value=1, max_value=25, value=1, step=1)
-with colB:
-    opp_default = _opponent_for_week(week)
-    opponent = st.text_input("Opponent (3-letter code preferred)", value=opp_default)
+# ----------------------------
+# 1) Weekly Notes
+# ----------------------------
+st.markdown("### 1) Weekly Notes")
+with st.expander("Notes"):
+    st.info("Add reminders/highlights. Saved under the selected Week & Opponent.")
+    note_text = st.text_area("Notes", height=110, placeholder="Key matchups, weather, personnel notes…")
+    if st.button("Save Notes"):
+        row = pd.DataFrame([{"Week": week, "Opponent": opponent, "Notes": note_text.strip()}])
+        append_to_sheet(row, SHEETS["notes"], dedup_cols=["Week","Opponent"])
+        st.success("Notes saved.")
 
-st.divider()
-
-# ---------- DATA ENTRY / UPLOAD SECTIONS (compact versions) ----------
-
-st.subheader("Upload Weekly Data")
-c1, c2, c3, c4 = st.columns(4)
+# ----------------------------
+# 2) Upload weekly data
+# ----------------------------
+st.markdown("### 2) Upload Weekly Data")
+c1, c2 = st.columns(2)
 
 with c1:
-    up_off = st.file_uploader("Upload Offense CSV", type=["csv"])
-    if up_off is not None:
+    st.subheader("Offense CSV")
+    st.caption("Example: Week,Opponent,Points,Yards,YPA,CMP%,SR%,…")
+    f = st.file_uploader("Upload Offense (.csv)", type=["csv"], key="off_upl")
+    if f:
         try:
-            df = pd.read_csv(up_off)
-            _append_rows(df, SHEETS["offense"], dedupe_on=["Week","Opponent"] if {"Week","Opponent"}.issubset(df.columns) else None)
-            st.success("Offense saved.")
+            df = pd.read_csv(f)
+            df["Week"] = df["Week"].astype(str)
+            df["Opponent"] = df["Opponent"].astype(str).str.upper()
+            append_to_sheet(df, SHEETS["offense"], dedup_cols=["Week","Opponent"])
+            st.success(f"Offense rows saved: {len(df)}")
         except Exception as e:
             st.error(f"Offense upload failed: {e}")
 
-with c2:
-    up_def = st.file_uploader("Upload Defense CSV", type=["csv"])
-    if up_def is not None:
+    st.subheader("Defense CSV")
+    st.caption("Example: Week,Opponent,SACK,INT,3D%_Allowed,RZ%_Allowed,Pressures,…")
+    f = st.file_uploader("Upload Defense (.csv)", type=["csv"], key="def_upl")
+    if f:
         try:
-            df = pd.read_csv(up_def)
-            _append_rows(df, SHEETS["defense"], dedupe_on=["Week","Opponent"] if {"Week","Opponent"}.issubset(df.columns) else None)
-            st.success("Defense saved.")
+            df = pd.read_csv(f)
+            df["Week"] = df["Week"].astype(str)
+            df["Opponent"] = df["Opponent"].astype(str).str.upper()
+            append_to_sheet(df, SHEETS["defense"], dedup_cols=["Week","Opponent"])
+            st.success(f"Defense rows saved: {len(df)}")
         except Exception as e:
             st.error(f"Defense upload failed: {e}")
 
-with c3:
-    up_per = st.file_uploader("Upload Personnel CSV", type=["csv"])
-    if up_per is not None:
+with c2:
+    st.subheader("Personnel CSV")
+    st.info(
+        "Personnel: Week,Opponent,11,12,13,21,Other | "
+        "Snap_Counts: Week,Opponent,Player,Snaps,Snap%,Side."
+    )
+    f = st.file_uploader("Upload Personnel (.csv)", type=["csv"], key="per_upl")
+    if f:
         try:
-            df = pd.read_csv(up_per)
-            _append_rows(df, SHEETS["personnel"], dedupe_on=["Week","Opponent"] if {"Week","Opponent"}.issubset(df.columns) else None)
-            st.success("Personnel saved.")
+            df = pd.read_csv(f)
+            df["Week"] = df["Week"].astype(str)
+            df["Opponent"] = df["Opponent"].astype(str).str.upper()
+            append_to_sheet(df, SHEETS["personnel"], dedup_cols=["Week","Opponent"])
+            st.success(f"Personnel rows saved: {len(df)}")
         except Exception as e:
             st.error(f"Personnel upload failed: {e}")
 
-with c4:
-    up_snap = st.file_uploader("Upload Snap Counts CSV", type=["csv"])
-    if up_snap is not None:
+    st.subheader("Snap Counts CSV")
+    st.caption("Columns: Week,Opponent,Player,Snaps,Snap%,Side")
+    f = st.file_uploader("Upload Snap Counts (.csv)", type=["csv"], key="snap_upl")
+    if f:
         try:
-            df = pd.read_csv(up_snap)
-            _append_rows(df, SHEETS["snap_counts"], dedupe_on=["Week","Opponent","Player"] if {"Week","Opponent","Player"}.issubset(df.columns) else None)
-            st.success("Snap counts saved.")
+            df = pd.read_csv(f)
+            df["Week"] = df["Week"].astype(str)
+            df["Opponent"] = df["Opponent"].astype(str).str.upper()
+            append_to_sheet(df, SHEETS["snap"], dedup_cols=["Week","Opponent","Player"])
+            st.success(f"Snap Count rows saved: {len(df)}")
         except Exception as e:
-            st.error(f"Snap counts upload failed: {e}")
+            st.error(f"Snap upload failed: {e}")
 
-st.divider()
+# ----------------------------
+# 3) Opponent / Injuries / Media
+# ----------------------------
+st.markdown("### 3) Opponent Preview / Injuries / Media")
+a, b, c = st.columns(3)
 
-st.subheader("Injuries (quick add)")
-inj_cols = st.columns(5)
-with inj_cols[0]:
-    inj_player = st.text_input("Player")
-with inj_cols[1]:
-    inj_status = st.selectbox("Status", ["", "Out", "Doubtful", "Questionable", "Probable"])
-with inj_cols[2]:
-    inj_body = st.text_input("BodyPart / Notes")
-with inj_cols[3]:
-    inj_week = st.number_input("Week (inj)", min_value=1, max_value=25, value=int(week))
-with inj_cols[4]:
-    if st.button("Save Injury"):
-        row = pd.DataFrame([{
-            "Week": int(inj_week),
-            "Opponent": opponent,
-            "Player": inj_player,
-            "Status": inj_status,
-            "Notes": inj_body,
-            "SavedAt": _now_str()
-        }])
-        _append_rows(row, SHEETS["injuries"], dedupe_on=["Week","Opponent","Player"])
-        st.success("Injury saved.")
-
-st.divider()
-
-st.subheader("Opponent Preview & Media Summaries")
-pcol1, pcol2 = st.columns(2)
-
-with pcol1:
-    st.markdown("**Opponent Preview**")
-    opp_notes = st.text_area("Notes", height=140, key="opp_notes")
+with a:
+    st.subheader("Opponent Preview")
+    opp_off = st.text_area("Offense Summary", height=110)
+    opp_def = st.text_area("Defense Summary", height=110)
+    opp_match = st.text_area("Key Matchups", height=110)
     if st.button("Save Opponent Preview"):
         row = pd.DataFrame([{
-            "Week": int(week),
-            "Opponent": opponent,
-            "Notes": opp_notes,
-            "SavedAt": _now_str()
+            "Week": week, "Opponent": opponent,
+            "Off_Summary": opp_off.strip(),
+            "Def_Summary": opp_def.strip(),
+            "Matchups": opp_match.strip()
         }])
-        _append_rows(row, SHEETS["opponent"], dedupe_on=["Week","Opponent"])
+        append_to_sheet(row, SHEETS["opp"], dedup_cols=["Week","Opponent"])
+        st.success("Opponent preview saved.")
 
-with pcol2:
-    st.markdown("**Media Summary**")
-    media_source = st.text_input("Source (e.g., ESPN, The Athletic)")
-    media_summary = st.text_area("Summary", height=140)
+with b:
+    st.subheader("Injuries")
+    p = st.text_input("Player")
+    s = st.selectbox("Status", ["Questionable","Doubtful","Out","IR","Healthy"])
+    bp = st.text_input("Body Part / Injury")
+    prac = st.text_input("Practice (DNP/Limited/Full)")
+    gstat = st.text_input("Game Status")
+    notes = st.text_area("Notes", height=90)
+    if st.button("Save Injury"):
+        if p.strip():
+            row = pd.DataFrame([{
+                "Week": week, "Opponent": opponent,
+                "Player": p.strip(), "Status": s, "BodyPart": bp.strip(),
+                "Practice": prac.strip(), "GameStatus": gstat.strip(), "Notes": notes.strip()
+            }])
+            append_to_sheet(row, SHEETS["inj"], dedup_cols=["Week","Opponent","Player"])
+            st.success("Injury saved.")
+        else:
+            st.error("Enter a player name.")
+
+with c:
+    st.subheader("Media Summaries")
+    src = st.text_input("Source")
+    summ = st.text_area("Summary", height=140)
     if st.button("Save Media Summary"):
-        row = pd.DataFrame([{
-            "Week": int(week),
-            "Opponent": opponent,
-            "Source": media_source,
-            "Summary": media_summary,
-            "SavedAt": _now_str()
-        }])
-        _append_rows(row, SHEETS["media"])
-        st.success("Media summary saved.")
+        if src.strip() and summ.strip():
+            row = pd.DataFrame([{
+                "Week": week, "Opponent": opponent,
+                "Source": src.strip(), "Summary": summ.strip()
+            }])
+            append_to_sheet(row, SHEETS["media"])
+            st.success("Media summary saved.")
+        else:
+            st.error("Enter both Source and Summary.")
 
-st.divider()
-
-st.subheader("Weekly Game Predictions")
-pred_cols = st.columns([1,1,1,2])
-with pred_cols[0]:
-    predicted_winner = st.selectbox("Predicted Winner", ["", "CHI", opponent])
-with pred_cols[1]:
-    confidence = st.slider("Confidence (%)", 0, 100, 60)
-with pred_cols[2]:
-    rationale_short = st.text_input("Rationale (short)")
-with pred_cols[3]:
-    rationale = st.text_area("Rationale (details)", height=100)
-
+# ----------------------------
+# 4) Prediction
+# ----------------------------
+st.markdown("### 4) Prediction")
+x, y = st.columns(2)
+with x:
+    who = st.selectbox("Predicted Winner", ["CHI","OPP"], index=0)
+    conf = st.slider("Confidence", 0, 100, 60)
+with y:
+    why = st.text_area("Rationale", height=120)
 if st.button("Save Prediction"):
     row = pd.DataFrame([{
-        "Week": int(week),
-        "Opponent": opponent,
-        "Predicted_Winner": predicted_winner,
-        "Confidence": confidence,
-        "Rationale_Short": rationale_short,
-        "Rationale": rationale,
-        "SavedAt": _now_str()
+        "Week": week, "Opponent": opponent,
+        "Predicted_Winner": "CHI" if who == "CHI" else opponent,
+        "Confidence": conf,
+        "Rationale": why.strip()
     }])
-    _append_rows(row, SHEETS["pred"], dedupe_on=["Week","Opponent"])
+    append_to_sheet(row, SHEETS["pred"], dedup_cols=["Week","Opponent"])
     st.success("Prediction saved.")
 
-st.divider()
+# ----------------------------
+# 5) Current Week Snapshots
+# ----------------------------
+st.markdown("### 5) Current Week Snapshots")
+tabs = st.tabs(["Offense","Defense","Personnel","Snap Counts","Injuries","Media","Opponent","Prediction","Notes"])
 
-# ---------- EXPORTS (Pre + Final restored) ----------
-st.subheader("Exports")
+def show_df(tab, sheet):
+    with tab:
+        df = read_sheet(sheet)
+        if not df.empty and {"Week","Opponent"}.issubset(df.columns):
+            df = df[(df["Week"].astype(str) == week) & (df["Opponent"].astype(str).str.upper() == opponent)]
+        st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No rows for this week/opponent yet."]}))
 
-def _build_pre_report(week: int, opponent: str) -> bytes:
-    blocks = _gather_week_blocks(week)
-    title = "Chicago Bears — PRE-GAME Weekly Report"
-    return _pdf_from_sections(title, week, opponent, blocks)
+show_df(tabs[0], SHEETS["offense"])
+show_df(tabs[1], SHEETS["defense"])
+show_df(tabs[2], SHEETS["personnel"])
+show_df(tabs[3], SHEETS["snap"])
+show_df(tabs[4], SHEETS["inj"])
+show_df(tabs[5], SHEETS["media"])
+show_df(tabs[6], SHEETS["opp"])
+show_df(tabs[7], SHEETS["pred"])
+show_df(tabs[8], SHEETS["notes"])
 
-def _build_final_report(week: int, opponent: str) -> bytes:
-    blocks = _gather_week_blocks(week)
-    title = "Chicago Bears — FINAL Weekly Report"
-    return _pdf_from_sections(title, week, opponent, blocks)
-
-ec1, ec2, ec3 = st.columns(3)
-
-with ec1:
-    if st.button("Export Pre-Game PDF"):  # <-- RESTORED Pre-Export button
-        pdf = _build_pre_report(week, opponent)
-        fname = f"{_week_code(week)}_Pre.pdf" if REPORTLAB_AVAILABLE else f"{_week_code(week)}_Pre.txt"
-        mime = "application/pdf" if REPORTLAB_AVAILABLE else "text/plain"
-        st.download_button("Download Pre-Game Report", data=pdf, file_name=fname, mime=mime)
-
-with ec2:
-    if st.button("Export Final PDF"):     # <-- RESTORED Final Export button
-        pdf = _build_final_report(week, opponent)
-        fname = f"{_week_code(week)}_Final.pdf" if REPORTLAB_AVAILABLE else f"{_week_code(week)}_Final.txt"
-        mime = "application/pdf" if REPORTLAB_AVAILABLE else "text/plain"
-        st.download_button("Download Final Report", data=pdf, file_name=fname, mime=mime)
-
-with ec3:
-    # Your existing button kept for compatibility (calls the same final export)
-    st.markdown("**Export Weekly Final PDF** *(kept for compatibility)*")
-    st.caption("This produces the same PDF as “Export Final PDF”.")
-    wk_to_export = st.number_input("Week to export", min_value=1, max_value=25, value=int(week), key="wk_export_final")
-    if st.button("Export final pdf"):
-        pdf = _build_final_report(wk_to_export, _opponent_for_week(wk_to_export) or opponent)
-        fname = f"{_week_code(wk_to_export)}_Final.pdf" if REPORTLAB_AVAILABLE else f"{_week_code(wk_to_export)}_Final.txt"
-        mime = "application/pdf" if REPORTLAB_AVAILABLE else "text/plain"
-        st.download_button("Download Final Report (compat)", data=pdf, file_name=fname, mime=mime, key="dl_final_compat")
-
-st.info("Tip: You can export as many times as you want. Use Pre-Game during the week; use Final after you’ve finished entering data.") Personnel: Week,Opponent,11,12,13,21,Other | Snap_Counts: Week,Opponent,Player,Snaps,Snap%,Side.")
-
-
-
-
-
-
-
-
-
+st.caption("Files are stored in ./data (master workbook). No PDF/Excel weekly exports in this simple version.")
