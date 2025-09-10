@@ -5,10 +5,10 @@
 # - Strategy tab, Global/Snap search
 # - Current week Excel/PDF download (one click)
 # - Dedupe by keys to avoid duplicate weeks
-#
-# NOTE: Auto-fetch uses the library 'nfl_data_py' (your requirements include it).
-# If a function isn’t available in your version, the app won’t crash; it will show
-# an instruction message instead.
+# - Excel color-coding (toggle in sidebar) for exports:
+#     * Auto-fit columns
+#     * 3-color scale on numeric columns
+#     * Data bars on Snap_Counts (Snaps, Snap%)
 
 from pathlib import Path
 from datetime import datetime
@@ -209,6 +209,10 @@ with st.sidebar:
         st.caption("Install/keep nfl_data_py to enable auto fetch.")
 
     st.markdown("---")
+    st.subheader("Excel Formatting")
+    apply_colors = st.checkbox("Apply Excel color formatting", value=True)
+
+    st.markdown("---")
     st.subheader("Current Week Download")
     btn_xlsx = st.button("Download Current Week (Excel)")
     btn_pdf  = st.button("Download Current Week (PDF)")
@@ -289,7 +293,7 @@ def fetch_nfl_data_auto(week_code: str, opp_code: str):
             ("rushing_tds", "RushTD"),
             ("targets", "Targets"),
             ("receptions", "Recs"),
-            ("sacks", "SacksAgainst"),    # if present at player level (QB)
+            ("sacks", "SacksAgainst"),
         ]:
             if field in df.columns:
                 out[alias] = pd.to_numeric(df[field], errors="coerce").fillna(0).sum()
@@ -312,7 +316,7 @@ def fetch_nfl_data_auto(week_code: str, opp_code: str):
     else:
         st.warning("No offense rows aggregated for this week/teams.")
 
-    # Very light defense (if tackles/sacks columns exist)
+    # Very light defense
     def agg_def(team_code):
         df = wk_df[wk_df[tcol].astype(str).str.upper() == team_code]
         if df.empty:
@@ -368,7 +372,7 @@ def fetch_snap_counts_auto(week_code: str, opp_code: str):
             try:
                 snap_df = f([season])
                 break
-            except Exception as e:
+            except Exception:
                 continue
 
     if snap_df is None or snap_df.empty:
@@ -413,7 +417,10 @@ def fetch_snap_counts_auto(week_code: str, opp_code: str):
         if pct_st  and pd.notna(row.get(pct_st)):  triples.append(("ST", row[pct_st]))
         if not triples:
             return ""
-        return max(triples, key=lambda x: (0 if pd.isna(x[1]) else float(x[1])))[0]
+        try:
+            return max(triples, key=lambda x: (0 if pd.isna(x[1]) else float(x[1])))[0]
+        except Exception:
+            return ""
 
     side_series = filt.apply(pick_side, axis=1)
 
@@ -469,7 +476,7 @@ with c1:
             df = read_any_table(f)
             try:
                 df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception as e:
+            except Exception:
                 if fill_missing:
                     df["Week"] = week
                     df["Opponent"] = opponent
@@ -490,7 +497,7 @@ with c1:
             df = read_any_table(f)
             try:
                 df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception as e:
+            except Exception:
                 if fill_missing:
                     df["Week"] = week
                     df["Opponent"] = opponent
@@ -515,7 +522,7 @@ with c2:
             df = read_any_table(f)
             try:
                 df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception as e:
+            except Exception:
                 if fill_missing:
                     df["Week"] = week
                     df["Opponent"] = opponent
@@ -536,7 +543,7 @@ with c2:
             df = read_any_table(f)
             try:
                 df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception as e:
+            except Exception:
                 if fill_missing:
                     df["Week"] = week
                     df["Opponent"] = opponent
@@ -651,11 +658,103 @@ def build_week_package(week_code: str, opp_code: str) -> dict:
             pkg[sheet_name] = df.copy()
     return pkg
 
-def export_week_excel(pkg: dict, path: Path):
+def _excel_apply_colors(path: Path):
+    """Post-process the written Excel file: auto-fit columns + color formatting."""
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+        from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+    except Exception:
+        # openpyxl not available? silently skip
+        return
+
+    wb = load_workbook(filename=path)
+    three_color = ColorScaleRule(
+        start_type='min', start_color='F8696B',  # red
+        mid_type='percentile', mid_value=50, mid_color='FFEB84',  # yellow
+        end_type='max', end_color='63BE7B'  # green
+    )
+    data_bar = DataBarRule(start_type="num", start_value=0, end_type="max", end_value=0, color="63BE7B", showValue="None")
+
+    for ws in wb.worksheets:
+        # Auto-fit columns (rough)
+        max_col = ws.max_column
+        max_row = ws.max_row
+        if max_row < 2:
+            # nothing to format
+            continue
+
+        # Build header map
+        headers = {}
+        for c in range(1, max_col+1):
+            header_val = ws.cell(row=1, column=c).value
+            headers[c] = str(header_val) if header_val is not None else f"Col{c}"
+
+        text_like = {"Week","Opponent","Team","Player","Side","Source","Summary","Notes","Rationale","Plan","Keys","Matchups","Off_Summary","Def_Summary"}
+
+        # Auto-fit widths
+        for c in range(1, max_col+1):
+            col_letter = get_column_letter(c)
+            max_len = len(headers[c])
+            for r in range(2, max_row+1):
+                v = ws.cell(r, c).value
+                if v is None:
+                    continue
+                s = str(v)
+                if len(s) > max_len:
+                    max_len = len(s)
+            ws.column_dimensions[col_letter].width = min(50, max(10, max_len + 2))
+
+        # Numeric color scale for numeric columns
+        for c in range(1, max_col+1):
+            header = headers[c]
+            if header in text_like:
+                continue
+            # detect numeric column by scanning a few cells
+            numeric = False
+            for r in range(2, min(max_row, 25)+1):
+                v = ws.cell(r, c).value
+                if isinstance(v, (int, float)) and v is not None:
+                    numeric = True
+                    break
+            if not numeric:
+                continue
+            col_letter = get_column_letter(c)
+            rng = f"{col_letter}2:{col_letter}{max_row}"
+            ws.conditional_formatting.add(rng, three_color)
+
+        # Special: Snap_Counts sheet data bars for Snaps & Snap%
+        if ws.title == "Snap_Counts":
+            # find columns
+            col_snaps = None
+            col_pct = None
+            for c in range(1, max_col+1):
+                h = headers[c].strip().lower()
+                if h in ("snaps",):
+                    col_snaps = c
+                if h in ("snap%", "snap%_", "snap_pct", "snappercent", "snapperc", "snap_pct_"):
+                    col_pct = c
+                if h == "snap%":
+                    col_pct = c
+            # Apply data bars if present
+            if col_snaps:
+                col_letter = get_column_letter(col_snaps)
+                ws.conditional_formatting.add(f"{col_letter}2:{col_letter}{max_row}", data_bar)
+            if col_pct:
+                col_letter = get_column_letter(col_pct)
+                ws.conditional_formatting.add(f"{col_letter}2:{col_letter}{max_row}", data_bar)
+
+    wb.save(path)
+
+def export_week_excel(pkg: dict, path: Path, colorize: bool):
+    # 1) Write plain data
     with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
         for sheet_name, df in pkg.items():
             safe = sheet_name[:31]
             (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=safe)
+    # 2) Color formatting + auto-fit
+    if colorize:
+        _excel_apply_colors(path)
 
 def export_week_pdf(pkg: dict, path: Path, title: str):
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
@@ -724,7 +823,7 @@ if btn_xlsx or btn_pdf:
     pkg = build_week_package(week, opponent)
     if btn_xlsx:
         x = CURR_DIR / f"{week}_{opponent}.xlsx"
-        export_week_excel(pkg, x)
+        export_week_excel(pkg, x, colorize=apply_colors)
         st.success(f"Saved: {x}")
         with open(x, "rb") as f:
             st.download_button("Download Current Week Excel (click to save)", f.read(), file_name=x.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -772,7 +871,6 @@ with s2:
 # ================== 6) Current Week Snapshots (with Search) ==================
 st.markdown("### 6) Current Week Snapshots (with Search)")
 tabs = st.tabs(["Offense","Defense","Personnel","Snap Counts","Injuries","Media","Opponent","Prediction","Notes","Strategy"])
-search_terms = []
 
 def show_df(tab, sheet):
     with tab:
