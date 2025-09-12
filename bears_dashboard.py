@@ -228,13 +228,99 @@ def upsert_sheet(path: str, sheet_name: str, df_new: pd.DataFrame, key_cols: Lis
 # -----------------------------
 
 def fetch_week_stats(team: str, opponent: str, week_int: int, season: int) -> Dict[str, float]:
-    """Attempt to fetch team+week stats using nfl_data_py. Returns a dict of metrics.
-    We keep this tolerant: if library/columns differ, we just return what we can.
+    """Best‑effort multi‑source fetch using nfl_data_py.
+    Tries several endpoints because upstream URLs sometimes change (404s).
     """
-    result = {}
+    result: Dict[str, float] = {}
     if nfl is None:
         st.warning("nfl_data_py not installed; cannot auto-fetch NFL data.")
         return result
+
+    def safe_try(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            st.info(f"Fallback note: {getattr(func, '__name__', 'call')} failed → {e}")
+            return None
+
+    # 1) Primary: weekly team stats (fast)
+    weekly = safe_try(nfl.import_weekly_data, [season])
+    if weekly is not None and not weekly.empty:
+        df = weekly.copy()
+        # Try common team column names
+        team_col = "team" if "team" in df.columns else ("posteam" if "posteam" in df.columns else None)
+        if team_col is not None and "week" in df.columns:
+            df_team = df[(df[team_col].astype(str).str.upper()==team.upper()) & (df["week"]==week_int)]
+            if not df_team.empty:
+                # Aggregate core offensive metrics
+                pass_yds = float(df_team.get("passing_yards", pd.Series(dtype=float)).sum() or 0)
+                if pass_yds == 0 and "pass_yards" in df_team: pass_yds = float(df_team["pass_yards"].sum())
+                rush_yds = float(df_team.get("rushing_yards", pd.Series(dtype=float)).sum() or 0)
+                if rush_yds == 0 and "rush_yards" in df_team: rush_yds = float(df_team["rush_yards"].sum())
+                pass_td = float(df_team.get("passing_tds", pd.Series(dtype=float)).sum() or 0)
+                rush_td = float(df_team.get("rushing_tds", pd.Series(dtype=float)).sum() or 0)
+                comp = df_team.get("completions", pd.Series(dtype=float)).sum() if "completions" in df_team else None
+                att  = df_team.get("attempts", pd.Series(dtype=float)).sum() if "attempts" in df_team else None
+                ypa  = float(pass_yds/att) if att and att!=0 else pd.NA
+                cmp  = float((comp/att)*100) if comp is not None and att and att!=0 else pd.NA
+                result.update({
+                    "PassYds": pass_yds,
+                    "RushYds": rush_yds,
+                    "PassTD": pass_td,
+                    "RushTD": rush_td,
+                    "YPA": ypa,
+                    "CMP%": cmp,
+                    "RecvYds": pass_yds if pd.isna(pass_yds)==False else pd.NA,
+                    "Total_YDS": (pass_yds + rush_yds)
+                })
+
+    # 2) Fallback: team seasonal summary (per‑game averages) — then take week row if present
+    if not result:
+        team_summ = safe_try(nfl.import_seasonal_team_stats, [season])
+        if team_summ is not None and not team_summ.empty:
+            df = team_summ.copy()
+            # If a weekly dimension exists, try filter; otherwise leave as placeholder
+            if "team" in df.columns:
+                df_team = df[df["team"].astype(str).str.upper()==team.upper()]
+                if not df_team.empty:
+                    # Use per‑game placeholders so exports have something (better than blank)
+                    result.update({
+                        "PassYds": float(df_team.get("pass_yds", pd.Series(dtype=float)).mean() or 0),
+                        "RushYds": float(df_team.get("rush_yds", pd.Series(dtype=float)).mean() or 0),
+                        "PassTD": float(df_team.get("pass_tds", pd.Series(dtype=float)).mean() or 0),
+                        "RushTD": float(df_team.get("rush_tds", pd.Series(dtype=float)).mean() or 0),
+                    })
+
+    # 3) Fallback: schedules/boxscores (if exposed)
+    if not result:
+        sched = safe_try(nfl.import_schedules, [season])
+        if sched is not None and not sched.empty:
+            # Try to locate game id for week
+            df = sched.copy()
+            # Abbreviation columns vary: team, team_home, team_away
+            if all(c in df.columns for c in ["team_home","team_away","week"]):
+                game = df[((df["team_home"].astype(str).str.upper()==team.upper()) | (df["team_away"].astype(str).str.upper()==team.upper())) & (df["week"]==week_int)]
+                if not game.empty:
+                    # If points columns exist, take them
+                    for side in ["home","away"]:
+                        pts_col = f"result_{side}" if f"result_{side}" in game.columns else (f"points_{side}" if f"points_{side}" in game.columns else None)
+                        if pts_col:
+                            try:
+                                result["Points"] = float(pd.to_numeric(game[pts_col], errors='coerce').iloc[0])
+                                break
+                            except Exception:
+                                pass
+
+    # Defensive placeholders (we still add them so columns exist downstream)
+    if "SacksAgainst" not in result:
+        result["SacksAgainst"] = pd.NA
+    for k in [
+        "Sacks","QB_Hits","Pressures","INT","Turnovers","FF","FR",
+        "3rd_Down%_Allowed","RZ%_Allowed","YdsAllowed_Pass","YdsAllowed_Rush","PointsAllowed"
+    ]:
+        result.setdefault(f"DEF__{k}", pd.NA)
+
+    return result
     try:
         # nflfastR weekly data (play-by-play derived). Using weekly is more stable than schedules.
         weekly = nfl.import_weekly_data([season])  # can be large; filtered next
@@ -650,5 +736,8 @@ st.markdown(
 - `Compute NFL Averages` fills any empty `NFL_Avg._*` columns for the current week where we could compute them.
 - Exports are saved to the `exports/` folder under your repo folder. Use the download buttons to grab them directly.
 - If you want deeper, play‑by‑play metrics (EPA, SR%, pressures), we can wire a second fetch path to merge from play‑by‑play and team‑defense tables.
+"""
+)
+
 """
 )
