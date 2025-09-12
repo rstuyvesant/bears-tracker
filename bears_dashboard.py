@@ -727,8 +727,7 @@ if final_pdf_btn:
             st.download_button("Download Final PDF", data=f, file_name=os.path.basename(path), mime="application/pdf")
 
 
-st.markdown(
-    """
+st.markdown(r"""
 ---
 **Notes**
 - This revision expands the field mapping and ensures **Week / Opponent / Team** are always set on upload.
@@ -736,8 +735,4 @@ st.markdown(
 - `Compute NFL Averages` fills any empty `NFL_Avg._*` columns for the current week where we could compute them.
 - Exports are saved to the `exports/` folder under your repo folder. Use the download buttons to grab them directly.
 - If you want deeper, play‑by‑play metrics (EPA, SR%, pressures), we can wire a second fetch path to merge from play‑by‑play and team‑defense tables.
-"""
-)
-
-"""
-)
+""")
