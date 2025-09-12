@@ -1,12 +1,13 @@
 ﻿# bears_dashboard.py
-# Bears Weekly Tracker with:
+# Bears Weekly Tracker
 # - Season picker + resilient Auto-Fetch (tries selected season; if empty, retries season-1)
-# - Auto fetch: NFL team data + Snap Counts (via nfl_data_py if available)
-# - Flexible CSV/XLSX ingestion (accepts .csv and common .cvs typo)
-# - Strategy tab, Global/Snap search
-# - Current week Excel/PDF downloads (one click)
+# - Auto fetch: NFL team Off/Def + Snap Counts (best-effort via nfl_data_py)
+# - Flexible CSV/XLSX ingestion (accepts .csv and the common .cvs typo)
+# - Strategy / Notes / Media / Injuries / Opponent Preview / Prediction
+# - Current-week Excel/PDF downloads (with optional Excel color formatting)
 # - Dedupe by keys to avoid duplicate weeks
-# - Excel color-coding toggle (auto-fit + gradients + data bars)
+# - PDF export sanitizes Unicode (no FPDF latin-1 errors)
+# - Updated Streamlit API: width="stretch" (no use_container_width warnings)
 
 from pathlib import Path
 from datetime import datetime
@@ -14,7 +15,6 @@ import re
 import pandas as pd
 import numpy as np
 import streamlit as st
-from fpdf import FPDF
 
 # Try to import nfl_data_py for auto fetch
 try:
@@ -62,7 +62,6 @@ FULLNAME_TO_CODE = {
     "minnesota vikings":"MIN","new england patriots":"NE","new orleans saints":"NO","new york giants":"NYG",
     "new york jets":"NYJ","philadelphia eagles":"PHI","pittsburgh steelers":"PIT","seattle seahawks":"SEA",
     "san francisco 49ers":"SF","tampa bay buccaneers":"TB","tennessee titans":"TEN","washington commanders":"WAS",
-    # common nicknames
     "chargers":"LAC","rams":"LAR","raiders":"LV","49ers":"SF","niners":"SF","bucs":"TB","buccaneers":"TB",
     "commanders":"WAS","football team":"WAS","vikings":"MIN","packers":"GB","lions":"DET","bears":"CHI",
     "browns":"CLE","bengals":"CIN","steelers":"PIT","ravens":"BAL","bills":"BUF","patriots":"NE","jets":"NYJ",
@@ -147,11 +146,7 @@ def read_any_table(upload) -> pd.DataFrame:
     return pd.read_csv(upload, engine="python")  # accepts .csv and .cvs
 
 def ensure_week_opp(df: pd.DataFrame, fallback_week=None, fallback_opp=None, force_fill_if_missing=True) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Ensure DF has Week and Opponent columns. If missing/not parseable and
-    force_fill_if_missing=True, fill from fallback_week/opponent.
-    Returns (df, warnings).
-    """
+    """Ensure DF has Week and Opponent columns; fill from sidebar when allowed."""
     warnings = []
     df2 = df.copy()
 
@@ -165,7 +160,6 @@ def ensure_week_opp(df: pd.DataFrame, fallback_week=None, fallback_opp=None, for
             df2[opp_col].astype(str).str.upper()
         )
 
-    # Fill from sidebar if missing and allowed
     if ("Week" not in df2.columns or df2["Week"].isna().all()) and force_fill_if_missing and fallback_week:
         df2["Week"] = str(fallback_week)
         warnings.append(f"Filled missing Week with sidebar value: {fallback_week}")
@@ -173,7 +167,6 @@ def ensure_week_opp(df: pd.DataFrame, fallback_week=None, fallback_opp=None, for
         df2["Opponent"] = str(fallback_opp).upper()
         warnings.append(f"Filled missing Opponent with sidebar value: {fallback_opp}")
 
-    # Final validation
     if "Week" not in df2.columns or df2["Week"].isna().all():
         raise ValueError("Missing or unreadable 'Week'. Include numeric week or values like W01, W1, or enable 'Auto-fill Week/Opponent' in sidebar.")
     if "Opponent" not in df2.columns or df2["Opponent"].isna().all():
@@ -191,7 +184,6 @@ def _guess_season() -> int:
 
 with st.sidebar:
     st.header("Weekly Controls")
-    # NEW: Season picker
     default_season = _guess_season()
     season = st.number_input("Season", min_value=1999, max_value=2100, value=default_season, step=1)
     week = st.selectbox("Week", week_options(), index=0)
@@ -233,13 +225,11 @@ with st.sidebar:
 
 # ================== Auto-Fetch implementations ==================
 def _try_import_weekly(season_year: int):
-    """Try multiple API names to get player-week data for a season; return DataFrame or None."""
+    """Try multiple API names to get player-week data; return DataFrame or None."""
     if not NFL_OK:
         return None
     df = None
-    # Primary API
-    func_names = ["import_weekly_data", "import_weekly_player_stats", "load_weekly_data"]
-    for fname in func_names:
+    for fname in ["import_weekly_data", "import_weekly_player_stats", "load_weekly_data"]:
         f = getattr(nfl, fname, None)
         if callable(f):
             try:
@@ -255,8 +245,7 @@ def _try_import_snaps(season_year: int):
     if not NFL_OK:
         return None
     df = None
-    func_names = ["import_snap_counts", "import_weekly_snap_counts", "load_snap_counts"]
-    for fname in func_names:
+    for fname in ["import_snap_counts", "import_weekly_snap_counts", "load_snap_counts"]:
         f = getattr(nfl, fname, None)
         if callable(f):
             try:
@@ -268,45 +257,32 @@ def _try_import_snaps(season_year: int):
     return df
 
 def fetch_nfl_data_auto(week_code: str, opp_code: str, season_year: int):
-    """Best-effort team offense/defense snapshot from nfl_data_py weekly data.
-       If season has no data, retries with season-1 and informs user.
-    """
+    """Build team Off/Def snapshots from weekly player data. Falls back to season-1 if needed."""
     if not NFL_OK:
         st.error("nfl_data_py not available. Please install/update it or upload CSVs manually.")
         return
-
-    # Parse week number
     try:
         wnum = int(str(week_code).lstrip("Ww"))
     except Exception:
         st.error(f"Could not parse week: {week_code}")
         return
 
-    tried = []
     for yr in (season_year, season_year - 1):
-        tried.append(yr)
         weekly = _try_import_weekly(yr)
         if weekly is not None and not weekly.empty:
             _build_off_def_from_weekly(weekly, wnum, week_code, opp_code)
             if yr != season_year:
                 st.warning(f"No weekly data for {season_year}; fetched from {yr} instead.")
             return
-    st.error("NFL weekly dataset unavailable from nfl_data_py for the selected season or the prior season. Upload offense/defense CSVs instead.")
+    st.error("NFL weekly dataset unavailable for the selected season (and prior season). Upload offense/defense CSVs instead.")
 
 def _build_off_def_from_weekly(weekly, wnum, week_code, opp_code):
     # Normalize team/week columns
-    tcol = None
-    for c in weekly.columns:
-        if str(c).lower() in ("team", "recent_team", "recent_team_abbr"):
-            tcol = c; break
+    tcol = next((c for c in weekly.columns if str(c).lower() in ("team","recent_team","recent_team_abbr")), None)
     if tcol is None:
         st.error("Could not find team column in weekly data.")
         return
-
-    wcol = None
-    for c in weekly.columns:
-        if str(c).lower() == "week":
-            wcol = c; break
+    wcol = next((c for c in weekly.columns if str(c).lower() == "week"), None)
     if wcol is None:
         st.error("Could not find week column in weekly data.")
         return
@@ -316,7 +292,6 @@ def _build_off_def_from_weekly(weekly, wnum, week_code, opp_code):
         st.warning(f"No weekly rows for week {wnum} in the imported dataset.")
         return
 
-    # Offense aggregate (sum common stats)
     def agg_off(team_code):
         df = wk_df[wk_df[tcol].astype(str).str.upper() == team_code]
         if df.empty:
@@ -341,19 +316,15 @@ def _build_off_def_from_weekly(weekly, wnum, week_code, opp_code):
             **out
         }])
 
-    off_rows = []
-    for team in ("CHI", opp_code):
-        r = agg_off(team)
-        if r is not None:
-            off_rows.append(r)
-    if off_rows:
-        off_df = pd.concat(off_rows, ignore_index=True)
+    off_frames = [agg_off(t) for t in ("CHI", opp_code)]
+    off_frames = [f for f in off_frames if f is not None]
+    if off_frames:
+        off_df = pd.concat(off_frames, ignore_index=True)
         append_to_sheet(off_df, SHEETS["offense"], dedup_cols=["Week","Opponent","Team"])
         st.success(f"Fetched NFL team offense snapshot for {week_code} (rows: {len(off_df)}).")
     else:
         st.info("No offense rows aggregated for this week/teams.")
 
-    # Light defense aggregate
     def agg_def(team_code):
         df = wk_df[wk_df[tcol].astype(str).str.upper() == team_code]
         if df.empty:
@@ -377,26 +348,20 @@ def _build_off_def_from_weekly(weekly, wnum, week_code, opp_code):
             **out
         }])
 
-    def_rows = []
-    for team in ("CHI", opp_code):
-        r = agg_def(team)
-        if r is not None:
-            def_rows.append(r)
-    if def_rows:
-        def_df = pd.concat(def_rows, ignore_index=True)
+    def_frames = [agg_def(t) for t in ("CHI", opp_code)]
+    def_frames = [f for f in def_frames if f is not None]
+    if def_frames:
+        def_df = pd.concat(def_frames, ignore_index=True)
         append_to_sheet(def_df, SHEETS["defense"], dedup_cols=["Week","Opponent","Team"])
         st.success(f"Fetched NFL team defense snapshot for {week_code} (rows: {len(def_df)}).")
     else:
         st.info("Defense stats not available in your weekly schema; upload defense CSV if needed.")
 
 def fetch_snap_counts_auto(week_code: str, opp_code: str, season_year: int):
-    """Best-effort snap count import; maps to (Week, Opponent, Player, Snaps, Snap%, Side).
-       If season has no data, retries with season-1 and informs user.
-    """
+    """Import snap counts -> (Week, Opponent, Player, Snaps, Snap%, Side). Falls back to season-1."""
     if not NFL_OK:
         st.error("nfl_data_py not available. Please install/update it or upload Snap Counts CSV.")
         return
-
     try:
         wnum = int(str(week_code).lstrip("Ww"))
     except Exception:
@@ -410,15 +375,11 @@ def fetch_snap_counts_auto(week_code: str, opp_code: str, season_year: int):
             if yr != season_year:
                 st.warning(f"No snap data for {season_year}; fetched from {yr} instead.")
             return
-    st.error("No snap counts found in nfl_data_py for the selected season or the prior season. Upload a snap CSV instead.")
+    st.error("No snap counts found for the selected season (and prior). Upload a snap CSV instead.")
 
 def _build_snaps_from_df(snap_df, wnum, week_code, opp_code):
-    # Helpers to find columns
     def find_col(dframe, options):
-        for c in dframe.columns:
-            if str(c).lower() in [o.lower() for o in options]:
-                return c
-        return None
+        return next((c for c in dframe.columns if str(c).lower() in [o.lower() for o in options]), None)
 
     tcol = find_col(snap_df, ["team","recent_team","recent_team_abbr"])
     ocol = find_col(snap_df, ["opponent","opp","opponent_team","opponent_abbr"])
@@ -437,13 +398,11 @@ def _build_snaps_from_df(snap_df, wnum, week_code, opp_code):
     filt = snap_df[snap_df[wcol] == wnum].copy()
     filt = filt[filt[tcol].astype(str).str.upper().isin(["CHI", opp_code])]
 
-    # Opponent
     if ocol:
         filt["Opponent"] = filt[ocol].astype(str).str.upper()
     else:
         filt["Opponent"] = np.where(filt[tcol].astype(str).str.upper() == "CHI", opp_code, "CHI")
 
-    # Side (choose the highest % among Off/Def/ST if present)
     def pick_side(row):
         triples = []
         if pct_off and pd.notna(row.get(pct_off)): triples.append(("Offense", row[pct_off]))
@@ -457,8 +416,6 @@ def _build_snaps_from_df(snap_df, wnum, week_code, opp_code):
             return ""
 
     side_series = filt.apply(pick_side, axis=1)
-
-    # Snaps (choose best available)
     snaps_col = snaps_cols[0] if snaps_cols else None
     if not snaps_col:
         filt["snaps_proxy"] = 0
@@ -509,7 +466,7 @@ with c1:
         try:
             df = read_any_table(f)
             try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=True)
+                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
             except Exception:
                 df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
             for w in warns: st.info(w)
@@ -525,7 +482,7 @@ with c1:
         try:
             df = read_any_table(f)
             try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=True)
+                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
             except Exception:
                 df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
             for w in warns: st.info(w)
@@ -542,7 +499,7 @@ with c2:
         try:
             df = read_any_table(f)
             try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=True)
+                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
             except Exception:
                 df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
             for w in warns: st.info(w)
@@ -558,7 +515,7 @@ with c2:
         try:
             df = read_any_table(f)
             try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=True)
+                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
             except Exception:
                 df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
             for w in warns: st.info(w)
@@ -670,7 +627,7 @@ def build_week_package(week_code: str, opp_code: str) -> dict:
     return pkg
 
 def _excel_apply_colors(path: Path):
-    """Post-process the written Excel file: auto-fit columns + color formatting."""
+    """Auto-fit + heat/color bars for numeric columns."""
     try:
         from openpyxl import load_workbook
         from openpyxl.utils import get_column_letter
@@ -680,9 +637,9 @@ def _excel_apply_colors(path: Path):
 
     wb = load_workbook(filename=path)
     three_color = ColorScaleRule(
-        start_type='min', start_color='F8696B',   # red
-        mid_type='percentile', mid_value=50, mid_color='FFEB84',  # yellow
-        end_type='max', end_color='63BE7B'       # green
+        start_type='min', start_color='F8696B',
+        mid_type='percentile', mid_value=50, mid_color='FFEB84',
+        end_type='max', end_color='63BE7B'
     )
     data_bar = DataBarRule(start_type="num", start_value=0, end_type="max", end_value=0, color="63BE7B", showValue="None")
 
@@ -692,11 +649,9 @@ def _excel_apply_colors(path: Path):
         if max_row < 2:
             continue
 
-        # Headers
         headers = {c: (ws.cell(1, c).value if ws.cell(1, c).value is not None else f"Col{c}") for c in range(1, max_col+1)}
         text_like = {"Week","Opponent","Team","Player","Side","Source","Summary","Notes","Rationale","Plan","Keys","Matchups","Off_Summary","Def_Summary"}
 
-        # Auto-fit widths
         from openpyxl.utils import get_column_letter
         for c in range(1, max_col+1):
             col_letter = get_column_letter(c)
@@ -709,12 +664,10 @@ def _excel_apply_colors(path: Path):
                     max_len = len(s)
             ws.column_dimensions[col_letter].width = min(50, max(10, max_len + 2))
 
-        # Numeric color scale for numeric columns
         for c in range(1, max_col+1):
             header = str(headers[c])
             if header in text_like:
                 continue
-            # detect numeric
             numeric = False
             for r in range(2, min(max_row, 25)+1):
                 v = ws.cell(r, c).value
@@ -726,7 +679,6 @@ def _excel_apply_colors(path: Path):
             col_letter = get_column_letter(c)
             ws.conditional_formatting.add(f"{col_letter}2:{col_letter}{max_row}", three_color)
 
-        # Data bars for Snap_Counts
         if ws.title == "Snap_Counts":
             col_snaps = None
             col_pct = None
@@ -745,24 +697,40 @@ def _excel_apply_colors(path: Path):
 
     wb.save(path)
 
-def export_week_excel(pkg: dict, path: Path, colorize: bool):
-    # 1) Write plain data
-    with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
-        for sheet_name, df in pkg.items():
-            safe = sheet_name[:31]
-            (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=safe)
-    # 2) Color formatting + auto-fit
-    if colorize:
-        _excel_apply_colors(path)
-
+# ---------- PDF export (sanitized for latin-1) ----------
 def export_week_pdf(pkg: dict, path: Path, title: str):
+    from fpdf import FPDF
+
+    def sanitize(s):
+        if s is None:
+            return ""
+        if not isinstance(s, str):
+            s = str(s)
+        s = (s.replace("—", "-").replace("–", "-").replace("…", "...")
+               .replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+               .replace("\u00A0", " "))
+        try:
+            s.encode("latin-1")
+            return s
+        except UnicodeEncodeError:
+            return s.encode("latin-1", "ignore").decode("latin-1")
+
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
     pdf.set_auto_page_break(auto=True, margin=15)
-    def H(t): pdf.set_font("Arial","B",14); pdf.cell(0,10,t,ln=True)
-    def P(t): pdf.set_font("Arial","",11); pdf.multi_cell(0,6,t if t else "-")
+
+    def H(t):
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, sanitize(t), ln=True)
+
+    def P(t):
+        pdf.set_font("Arial", "", 11)
+        txt = sanitize(t) if t else "-"
+        pdf.multi_cell(0, 6, txt)
 
     pdf.add_page()
-    pdf.set_font("Arial","B",16); pdf.cell(0,10,title,ln=True); pdf.ln(4)
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, sanitize(title.replace("—", "-")), ln=True)
+    pdf.ln(4)
 
     H("Weekly Notes")
     n = pkg.get(SHEETS["notes"], pd.DataFrame())
@@ -790,7 +758,7 @@ def export_week_pdf(pkg: dict, path: Path, title: str):
     inj = pkg.get(SHEETS["inj"], pd.DataFrame())
     if not inj.empty:
         for _, r in inj.iterrows():
-            P(f"{r.get('Player','')} — {r.get('Status','')} — {r.get('BodyPart','')}; "
+            P(f"{r.get('Player','')} - {r.get('Status','')} - {r.get('BodyPart','')}; "
               f"Practice: {r.get('Practice','')}; Game: {r.get('GameStatus','')}; "
               f"Notes: {r.get('Notes','')}")
     else:
@@ -814,31 +782,50 @@ def export_week_pdf(pkg: dict, path: Path, title: str):
     else:
         P("")
 
-    pdf.ln(6); pdf.set_font("Arial","I",9); pdf.cell(0,6,"Generated by Bears Weekly Tracker",ln=True)
+    pdf.ln(6); pdf.set_font("Arial", "I", 9)
+    P("Generated by Bears Weekly Tracker")
     pdf.output(str(path))
 
-# Buttons for current-week downloads
+def export_week_excel(pkg: dict, path: Path, colorize: bool):
+    with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
+        for sheet_name, df in pkg.items():
+            safe = sheet_name[:31]
+            (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=safe)
+    if colorize:
+        _excel_apply_colors(path)
+
+# Downloads
 if btn_xlsx or btn_pdf:
     pkg = build_week_package(week, opponent)
     if btn_xlsx:
         x = CURR_DIR / f"{week}_{opponent}.xlsx"
-        export_week_excel(pkg, x, colorize=apply_colors)
-        st.success(f"Saved: {x}")
-        with open(x, "rb") as f:
-            st.download_button("Download Current Week Excel (click to save)", f.read(), file_name=x.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        try:
+            export_week_excel(pkg, x, colorize=apply_colors)
+            st.success(f"Saved: {x}")
+            with open(x, "rb") as f:
+                st.download_button("Download Current Week Excel (click to save)", f.read(),
+                                   file_name=x.name,
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(f"Excel export failed: {e}")
     if btn_pdf:
         p = CURR_DIR / f"{week}_{opponent}.pdf"
-        export_week_pdf(pkg, p, title=f"Weekly Report — {week} vs {opponent}")
-        st.success(f"Saved: {p}")
-        with open(p, "rb") as f:
-            st.download_button("Download Current Week PDF (click to save)", f.read(), file_name=p.name, mime="application/pdf")
+        try:
+            export_week_pdf(pkg, p, title=f"Weekly Report - {week} vs {opponent}")
+            st.success(f"Saved: {p}")
+            with open(p, "rb") as f:
+                st.download_button("Download Current Week PDF (click to save)", f.read(),
+                                   file_name=p.name, mime="application/pdf")
+        except Exception as e:
+            st.error(f"PDF export failed: {e}")
 
 # ================== 5) Search & Snap Finder ==================
 st.markdown("### 5) Search & Snap Finder")
 s1, s2 = st.columns([2,1])
 with s1:
     st.subheader("Global Search (choose a table)")
-    table_choice = st.selectbox("Table", list(SHEETS.values()), index=list(SHEETS.values()).index(SHEETS["snap"]))
+    table_choice = st.selectbox("Table", list(SHEETS.values()),
+                                index=list(SHEETS.values()).index(SHEETS["snap"]))
     q = st.text_input("Search text (matches anywhere in the selected table)", "")
     df = read_sheet(table_choice)
     if not df.empty and q.strip():
@@ -846,7 +833,7 @@ with s1:
         mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(qlow, na=False))
         df = df[mask.any(axis=1)]
     st.dataframe(df if not df.empty else pd.DataFrame({"Info":["No rows (or no matches)."]}),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
 
 with s2:
     st.subheader("Search Snap Counts")
@@ -863,7 +850,7 @@ with s2:
         if snap_week != "(any)" and "Week" in filt.columns:
             filt = filt[filt["Week"].astype(str) == snap_week]
         st.dataframe(filt if not filt.empty else pd.DataFrame({"Info":["No snap rows match."]}),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
     else:
         st.info("No snap data yet. Use auto-fetch or upload.")
 
@@ -886,7 +873,7 @@ def show_df(tab, sheet):
             mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(qlow, na=False))
             df = df[mask.any(axis=1)]
         st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No rows for this week/opponent (or search filtered all)."]}),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
 
 show_df(tabs[0], SHEETS["offense"])
 show_df(tabs[1], SHEETS["defense"])
