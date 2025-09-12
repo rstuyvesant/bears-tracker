@@ -503,14 +503,30 @@ if compute_avg_btn:
             st.info("Excel not available to update.")
 
 # -----------------------------
-# Live Previews
+# Live Previews (robust to missing sheets)
 # -----------------------------
+
+def ensure_sheet_exists(wb, sheet_name: str, cols: List[str]):
+    if sheet_name not in wb.sheetnames:
+        ws_new = wb.create_sheet(title=sheet_name)
+        ws_new.append(cols)
+        return ws_new
+    return wb[sheet_name]
+
 st.markdown("### Live Data Preview (current Excel)")
 if openpyxl is not None and os.path.exists(DATA_FILE):
     wb = openpyxl.load_workbook(DATA_FILE)
+    # Make sure the expected sheets exist (prevents KeyError)
+    for sname, scols in SHEET_ORDER:
+        ensure_sheet_exists(wb, sname, scols)
+    wb.save(DATA_FILE)
+
     tabs = st.tabs([s for s,_ in SHEET_ORDER])
-    for tab, (sheet_name, _) in zip(tabs, SHEET_ORDER):
+    for tab, (sheet_name, s_cols) in zip(tabs, SHEET_ORDER):
         with tab:
+            if sheet_name not in wb.sheetnames:
+                st.write("(sheet not found — created with headers; add data to view)")
+                continue
             ws = wb[sheet_name]
             data = list(ws.values)
             if not data:
@@ -519,7 +535,7 @@ if openpyxl is not None and os.path.exists(DATA_FILE):
                 header = list(data[0])
                 rows = data[1:]
                 df = pd.DataFrame(rows, columns=header)
-                st.dataframe(df, width="stretch")
+                st.dataframe(df, width='stretch')
 else:
     st.info("Excel not found yet; upload a CSV or fetch to create it.")
 
