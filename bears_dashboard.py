@@ -1,889 +1,638 @@
-﻿# bears_dashboard.py
-# Bears Weekly Tracker
-# - Season picker + resilient Auto-Fetch (tries selected season; if empty, retries season-1)
-# - Auto fetch: NFL team Off/Def + Snap Counts (best-effort via nfl_data_py)
-# - Flexible CSV/XLSX ingestion (accepts .csv and the common .cvs typo)
-# - Strategy / Notes / Media / Injuries / Opponent Preview / Prediction
-# - Current-week Excel/PDF downloads (with optional Excel color formatting)
-# - Dedupe by keys to avoid duplicate weeks
-# - PDF export sanitizes Unicode (no FPDF latin-1 errors)
-# - Updated Streamlit API: width="stretch" (no use_container_width warnings)
+﻿import os
+import io
+from typing import Dict, List
 
-from pathlib import Path
-from datetime import datetime
-import re
-import pandas as pd
-import numpy as np
 import streamlit as st
+import pandas as pd
+from datetime import datetime
 
-# Try to import nfl_data_py for auto fetch
+# Optional imports guarded for environments where they may not exist
 try:
     import nfl_data_py as nfl
-    NFL_OK = True
 except Exception:
-    NFL_OK = False
+    nfl = None
 
-# ================== App basics ==================
-st.set_page_config(page_title="Bears Weekly Tracker", layout="wide")
-st.title("Bears Weekly Tracker")
+try:
+    from fpdf import FPDF
+except Exception:
+    FPDF = None
 
-BASE_DIR = Path(__file__).parent.resolve()
-DATA_DIR = BASE_DIR / "data"
-EXPORTS_DIR = BASE_DIR / "exports"
-CURR_DIR = EXPORTS_DIR / "Current_Week"
-MASTER_XLSX = DATA_DIR / "bears_weekly_analytics.xlsx"
+try:
+    import openpyxl
+    from openpyxl.utils.dataframe import dataframe_to_rows
+except Exception:
+    openpyxl = None
 
-for p in (DATA_DIR, EXPORTS_DIR, CURR_DIR):
-    p.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# App Config
+# -----------------------------
+st.set_page_config(page_title="Chicago Bears 2025–26 Weekly Tracker", layout="wide")
+st.title("🐻 Chicago Bears 2025–26 Weekly Tracker — Full Revision (2025‑09‑11)")
 
-SHEETS = {
-    "offense": "Offense",
-    "defense": "Defense",
-    "personnel": "Personnel",
-    "snap": "Snap_Counts",
-    "inj": "Injuries",
-    "media": "Media",
-    "opp": "Opponent_Preview",
-    "pred": "Predictions",
-    "notes": "Weekly_Notes",
-    "strategy": "Weekly_Strategy",
-}
+# Project paths
+BASE_DIR = os.getcwd()
+DATA_FILE = os.path.join(BASE_DIR, "bears_weekly_analytics.xlsx")
+EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
-NFL_CODES = [
-    "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET","GB","HOU","IND",
-    "JAX","KC","LAC","LAR","LV","MIA","MIN","NE","NO","NYG","NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
+# -----------------------------
+# Utilities
+# -----------------------------
+NFL_TEAMS = [
+    "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE","DAL","DEN","DET",
+    "GB","HOU","IND","JAX","KC","LV","LAC","LAR","MIA","MIN","NE","NO",
+    "NYG","NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS"
 ]
-FULLNAME_TO_CODE = {
-    "arizona cardinals":"ARI","atlanta falcons":"ATL","baltimore ravens":"BAL","buffalo bills":"BUF",
-    "carolina panthers":"CAR","chicago bears":"CHI","cincinnati bengals":"CIN","cleveland browns":"CLE",
-    "dallas cowboys":"DAL","denver broncos":"DEN","detroit lions":"DET","green bay packers":"GB",
-    "houston texans":"HOU","indianapolis colts":"IND","jacksonville jaguars":"JAX","kansas city chiefs":"KC",
-    "los angeles chargers":"LAC","los angeles rams":"LAR","las vegas raiders":"LV","miami dolphins":"MIA",
-    "minnesota vikings":"MIN","new england patriots":"NE","new orleans saints":"NO","new york giants":"NYG",
-    "new york jets":"NYJ","philadelphia eagles":"PHI","pittsburgh steelers":"PIT","seattle seahawks":"SEA",
-    "san francisco 49ers":"SF","tampa bay buccaneers":"TB","tennessee titans":"TEN","washington commanders":"WAS",
-    "chargers":"LAC","rams":"LAR","raiders":"LV","49ers":"SF","niners":"SF","bucs":"TB","buccaneers":"TB",
-    "commanders":"WAS","football team":"WAS","vikings":"MIN","packers":"GB","lions":"DET","bears":"CHI",
-    "browns":"CLE","bengals":"CIN","steelers":"PIT","ravens":"BAL","bills":"BUF","patriots":"NE","jets":"NYJ",
-    "giants":"NYG","eagles":"PHI","cowboys":"DAL","texans":"HOU","colts":"IND","jaguars":"JAX","chiefs":"KC",
-    "dolphins":"MIA","falcons":"ATL","panthers":"CAR","broncos":"DEN","seahawks":"SEA","cardinals":"ARI","titans":"TEN"
-}
 
-def week_options():
-    return [f"W{str(i).zfill(2)}" for i in range(1, 24)]
+CURRENT_SEASON = datetime.now().year if datetime.now().month >= 9 else datetime.now().year - 1
 
-# ================== Excel helpers ==================
-def ensure_master():
-    """Create master workbook with all sheets on first run."""
-    if MASTER_XLSX.exists():
-        return
-    with pd.ExcelWriter(MASTER_XLSX, engine="openpyxl", mode="w") as w:
-        pd.DataFrame(columns=["Week","Opponent"]).to_excel(w, index=False, sheet_name=SHEETS["offense"])
-        pd.DataFrame(columns=["Week","Opponent"]).to_excel(w, index=False, sheet_name=SHEETS["defense"])
-        pd.DataFrame(columns=["Week","Opponent","11","12","13","21","Other"]).to_excel(w, index=False, sheet_name=SHEETS["personnel"])
-        pd.DataFrame(columns=["Week","Opponent","Player","Snaps","Snap%","Side"]).to_excel(w, index=False, sheet_name=SHEETS["snap"])
-        pd.DataFrame(columns=["Week","Opponent","Player","Status","BodyPart","Practice","GameStatus","Notes"]).to_excel(w, index=False, sheet_name=SHEETS["inj"])
-        pd.DataFrame(columns=["Week","Opponent","Source","Summary"]).to_excel(w, index=False, sheet_name=SHEETS["media"])
-        pd.DataFrame(columns=["Week","Opponent","Off_Summary","Def_Summary","Matchups"]).to_excel(w, index=False, sheet_name=SHEETS["opp"])
-        pd.DataFrame(columns=["Week","Opponent","Predicted_Winner","Confidence","Rationale"]).to_excel(w, index=False, sheet_name=SHEETS["pred"])
-        pd.DataFrame(columns=["Week","Opponent","Notes"]).to_excel(w, index=False, sheet_name=SHEETS["notes"])
-        pd.DataFrame(columns=["Week","Opponent","Plan","Keys","Notes"]).to_excel(w, index=False, sheet_name=SHEETS["strategy"])
+OPPONENTS = [t for t in NFL_TEAMS if t != "CHI"]
 
-def read_sheet(name: str) -> pd.DataFrame:
-    ensure_master()
+DEF_EXPANDED_COLS = [
+    "Week","Opponent","Team",
+    "Sacks","QB_Hits","Pressures","INT","Turnovers","FF","FR",
+    "3rd_Down%_Allowed","RZ%_Allowed","YdsAllowed_Pass","YdsAllowed_Rush","PointsAllowed",
+    "NFL_Avg._Sacks","NFL_Avg._QB_Hits","NFL_Avg._Pressures","NFL_Avg._INT","NFL_Avg._Turnovers",
+    "NFL_Avg._FF","NFL_Avg._FR","NFL_Avg._3rd_Down%_Allowed","NFL_Avg._RZ%_Allowed",
+    "NFL_Avg._YdsAllowed_Pass","NFL_Avg._YdsAllowed_Rush","NFL_Avg._PointsAllowed"
+]
+
+OFF_EXPANDED_COLS = [
+    "Week","Opponent","Team",
+    "PassYds","RushYds","RecvYds",
+    "PassTD","RushTD","Points",
+    "Turnovers","SacksAgainst",
+    "YPA","CMP%","YAC","Targets","Recs",
+    "1D","Total_YDS",
+    "QBR","SR%","EPA","DVOA","Red_Zone%","3rd_Down_Conv%","Expl_Plays (20+)",
+    "NFL_Avg._PassYds","NFL_Avg._RushYds","NFL_Avg._PassTD","NFL_Avg._RushTD",
+    "NFL_Avg._Points","NFL_Avg._Turnovers","NFL_Avg._SacksAgainst",
+    "NFL_Avg._YPA","NFL_Avg._CMP%","NFL_Avg._YAC","NFL_Avg._Targets",
+    "NFL_Avg._Recs","NFL_Avg._1D","NFL_Avg._Total_YDS",
+    "NFL_Avg._QBR","NFL_Avg._SR%","NFL_Avg._EPA","NFL_Avg._DVOA",
+    "NFL_Avg._Red_Zone%","NFL_Avg._3rd_Down_Conv%","NFL_Avg._Expl_Plays (20+)"
+]
+
+PERSONNEL_COLS = [
+    "Week","Opponent","Team",
+    "11_Personnel","12_Personnel","13_Personnel","21_Personnel","Other_Personnel","Total_Snaps",
+    "NFL_Avg._11_Personnel","NFL_Avg._12_Personnel","NFL_Avg._13_Personnel",
+    "NFL_Avg._21_Personnel","NFL_Avg._Other_Personnel","NFL_Avg._Total_Snaps"
+]
+
+SNAPCOUNTS_COLS = [
+    "Week","Opponent","Team",
+    # Flexible player columns; users can rename in CSVs without breaking the app
+    "Player1","Player2","Player3","Player4","Player5","Player6","Player7","Player8","Player9","Player10","Player11",
+    "NFL_Avg._RBs","NFL_Avg._WRs","NFL_Avg._TEs","NFL_Avg._QB","NFL_Avg._OL","NFL_Avg._DL","NFL_Avg._LB","NFL_Avg._DB"
+]
+
+SHEET_ORDER = [
+    ("Offense", OFF_EXPANDED_COLS),
+    ("Defense", DEF_EXPANDED_COLS),
+    ("Personnel", PERSONNEL_COLS),
+    ("Snap_Counts", SNAPCOUNTS_COLS),
+    ("Injuries", ["Week","Opponent","Team","Player","Status","BodyPart","Practice","GameStatus","Notes"]),
+    ("Media", ["Week","Opponent","Source","Summary"]),
+    ("Opponent_Preview", ["Week","Opponent","Key_Threats","Tendencies","Injuries","Notes"]),
+    ("Predictions", ["Week","Opponent","Predicted_Winner","Confidence","Rationale"]),
+    ("Weekly_Notes", ["Week","Opponent","Notes"]),
+    ("Weekly_Strategy", ["Week","Opponent","Off_Strategy","Def_Strategy","Key_Matchups","Keys_to_Win"]) 
+]
+
+
+def normalize_week(val) -> str:
+    if pd.isna(val):
+        return "W01"
     try:
-        return pd.read_excel(MASTER_XLSX, sheet_name=name)
+        ival = int(float(val))
+        return f"W{ival:02d}"
     except Exception:
-        return pd.DataFrame()
+        s = str(val).strip().upper()
+        if s.startswith("W") and len(s) >= 3:
+            return s
+        return "W01"
 
-def write_sheet(df: pd.DataFrame, name: str):
-    ensure_master()
-    with pd.ExcelWriter(MASTER_XLSX, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-        (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=name)
 
-def append_to_sheet(new_rows: pd.DataFrame, name: str, dedup_cols=None):
-    old = read_sheet(name)
-    combined = pd.concat([old, new_rows], ignore_index=True)
-    if dedup_cols and all(c in combined.columns for c in dedup_cols):
-        combined = combined.drop_duplicates(subset=dedup_cols, keep="last").reset_index(drop=True)
-    write_sheet(combined, name)
+def ensure_columns(df: pd.DataFrame, required: List[str]) -> pd.DataFrame:
+    for col in required:
+        if col not in df.columns:
+            df[col] = pd.NA
+    # Put Week/Opponent/Team first when present
+    front = [c for c in ["Week","Opponent","Team"] if c in required]
+    ordered = front + [c for c in required if c not in front]
+    return df.reindex(columns=ordered)
 
-# ================== Flexible ingestion helpers ==================
-def _normalize_columns(cols):
-    return {c: re.sub(r"[_\s]+", "", str(c).lower()) for c in cols}
 
-def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    norm = _normalize_columns(df.columns)
-    cand_norm = [re.sub(r"[_\s]+","", c.lower()) for c in candidates]
-    for original, simple in norm.items():
-        if simple in cand_norm:
-            return original
-    return None
+def clean_df(df: pd.DataFrame, opponent: str, team: str = "CHI") -> pd.DataFrame:
+    # Remove unnamed columns
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")].copy()
 
-def map_team_to_code(val: str) -> str | None:
-    if not isinstance(val, str):
-        return None
-    v = val.strip().upper()
-    if v in NFL_CODES:
-        return v
-    return FULLNAME_TO_CODE.get(val.strip().lower())
+    # Fill Week/Opponent/Team
+    if "Week" not in df.columns:
+        df["Week"] = "W01"
+    df["Week"] = df["Week"].apply(normalize_week)
 
-def coerce_week_value(v) -> str | None:
-    try:
-        if isinstance(v, str) and v.strip().upper().startswith("W"):
-            num = int(re.sub(r"[^\d]","", v))
-        else:
-            num = int(float(v))
-        return f"W{num:02d}"
-    except Exception:
-        return None
+    if "Opponent" not in df.columns:
+        df["Opponent"] = opponent
+    df["Opponent"] = df["Opponent"].fillna(opponent)
 
-def read_any_table(upload) -> pd.DataFrame:
-    """Read CSV (.csv or .cvs) or Excel (.xlsx/.xls)."""
-    name = (upload.name or "").lower()
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(upload)
-    return pd.read_csv(upload, engine="python")  # accepts .csv and .cvs
+    if "Team" not in df.columns:
+        df["Team"] = team
+    df["Team"] = df["Team"].fillna(team)
 
-def ensure_week_opp(df: pd.DataFrame, fallback_week=None, fallback_opp=None, force_fill_if_missing=True) -> tuple[pd.DataFrame, list[str]]:
-    """Ensure DF has Week and Opponent columns; fill from sidebar when allowed."""
-    warnings = []
-    df2 = df.copy()
+    # Drop rows that are entirely blank across metrics (excluding identifiers)
+    id_cols = {"Week","Opponent","Team"}
+    metric_cols = [c for c in df.columns if c not in id_cols]
+    mask = df[metric_cols].apply(lambda r: r.isna().all() or (r.astype(str).str.strip()=="").all(), axis=1)
+    df = df.loc[~mask].copy()
 
-    wk_col = _find_col(df2, ["Week","Wk","WK","GameWeek","Game_Week"])
-    opp_col = _find_col(df2, ["Opponent","Opp","OppCode","Team","OpponentTeam","OpponentName","Opp Abbr","OppAbbr"])
-
-    if wk_col is not None:
-        df2["Week"] = df2[wk_col].map(coerce_week_value)
-    if opp_col is not None:
-        df2["Opponent"] = df2[opp_col].map(map_team_to_code).fillna(
-            df2[opp_col].astype(str).str.upper()
-        )
-
-    if ("Week" not in df2.columns or df2["Week"].isna().all()) and force_fill_if_missing and fallback_week:
-        df2["Week"] = str(fallback_week)
-        warnings.append(f"Filled missing Week with sidebar value: {fallback_week}")
-    if ("Opponent" not in df2.columns or df2["Opponent"].isna().all()) and force_fill_if_missing and fallback_opp:
-        df2["Opponent"] = str(fallback_opp).upper()
-        warnings.append(f"Filled missing Opponent with sidebar value: {fallback_opp}")
-
-    if "Week" not in df2.columns or df2["Week"].isna().all():
-        raise ValueError("Missing or unreadable 'Week'. Include numeric week or values like W01, W1, or enable 'Auto-fill Week/Opponent' in sidebar.")
-    if "Opponent" not in df2.columns or df2["Opponent"].isna().all():
-        raise ValueError("Missing or unreadable 'Opponent'. Use team code (e.g., MIN) or full team name, or enable 'Auto-fill Week/Opponent' in sidebar.")
-
-    df2["Week"] = df2["Week"].astype(str)
-    df2["Opponent"] = df2["Opponent"].astype(str).str.upper()
-
-    return df2, warnings
-
-# ================== Sidebar: controls & auto fetch ==================
-def _guess_season() -> int:
-    today = datetime.now()
-    return today.year if today.month >= 8 else (today.year - 1)
-
-with st.sidebar:
-    st.header("Weekly Controls")
-    default_season = _guess_season()
-    season = st.number_input("Season", min_value=1999, max_value=2100, value=default_season, step=1)
-    week = st.selectbox("Week", week_options(), index=0)
-    opponent = st.selectbox("Opponent", NFL_CODES, index=NFL_CODES.index("MIN") if "MIN" in NFL_CODES else 0)
-
-    st.markdown("---")
-    st.subheader("Import Options")
-    fill_missing = st.checkbox("Auto-fill missing Week/Opponent from sidebar", value=True)
-
-    st.markdown("---")
-    st.subheader("Auto-Fetch (via nfl_data_py)")
-    colA, colB = st.columns(2)
-    with colA:
-        auto_nfl_btn = st.button("Fetch NFL Data (Auto)")
-    with colB:
-        auto_snaps_btn = st.button("Fetch Snap Counts (Auto)")
-    if not NFL_OK:
-        st.caption("Install/keep nfl_data_py to enable auto fetch.")
-
-    st.markdown("---")
-    st.subheader("Excel Formatting")
-    apply_colors = st.checkbox("Apply Excel color formatting", value=True)
-
-    st.markdown("---")
-    st.subheader("Current Week Download")
-    btn_xlsx = st.button("Download Current Week (Excel)")
-    btn_pdf  = st.button("Download Current Week (PDF)")
-
-    st.markdown("---")
-    st.subheader("Master Workbook")
-    ensure_master()
-    with open(MASTER_XLSX, "rb") as f:
-        st.download_button(
-            "Download Master Excel",
-            data=f.read(),
-            file_name="bears_weekly_analytics.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-# ================== Auto-Fetch implementations ==================
-def _try_import_weekly(season_year: int):
-    """Try multiple API names to get player-week data; return DataFrame or None."""
-    if not NFL_OK:
-        return None
-    df = None
-    for fname in ["import_weekly_data", "import_weekly_player_stats", "load_weekly_data"]:
-        f = getattr(nfl, fname, None)
-        if callable(f):
-            try:
-                df = f([season_year])
-                if df is not None and not df.empty:
-                    return df
-            except Exception:
-                pass
     return df
 
-def _try_import_snaps(season_year: int):
-    """Try multiple API names to get snap counts; return DataFrame or None."""
-    if not NFL_OK:
-        return None
-    df = None
-    for fname in ["import_snap_counts", "import_weekly_snap_counts", "load_snap_counts"]:
-        f = getattr(nfl, fname, None)
-        if callable(f):
-            try:
-                df = f([season_year])
-                if df is not None and not df.empty:
-                    return df
-            except Exception:
-                pass
-    return df
 
-def fetch_nfl_data_auto(week_code: str, opp_code: str, season_year: int):
-    """Build team Off/Def snapshots from weekly player data. Falls back to season-1 if needed."""
-    if not NFL_OK:
-        st.error("nfl_data_py not available. Please install/update it or upload CSVs manually.")
+# -----------------------------
+# Excel helpers
+# -----------------------------
+
+def init_workbook(path: str):
+    if openpyxl is None:
+        st.warning("openpyxl not installed — Excel features limited.")
         return
-    try:
-        wnum = int(str(week_code).lstrip("Ww"))
-    except Exception:
-        st.error(f"Could not parse week: {week_code}")
+    if not os.path.exists(path):
+        wb = openpyxl.Workbook()
+        # remove default sheet
+        wb.remove(wb.active)
+        for sheet_name, cols in SHEET_ORDER:
+            ws = wb.create_sheet(title=sheet_name)
+            ws.append(cols)
+        wb.save(path)
+
+
+def upsert_sheet(path: str, sheet_name: str, df_new: pd.DataFrame, key_cols: List[str] = ["Week","Opponent","Team"]):
+    if openpyxl is None:
+        st.error("openpyxl not available; cannot write Excel.")
         return
-
-    for yr in (season_year, season_year - 1):
-        weekly = _try_import_weekly(yr)
-        if weekly is not None and not weekly.empty:
-            _build_off_def_from_weekly(weekly, wnum, week_code, opp_code)
-            if yr != season_year:
-                st.warning(f"No weekly data for {season_year}; fetched from {yr} instead.")
-            return
-    st.error("NFL weekly dataset unavailable for the selected season (and prior season). Upload offense/defense CSVs instead.")
-
-def _build_off_def_from_weekly(weekly, wnum, week_code, opp_code):
-    # Normalize team/week columns
-    tcol = next((c for c in weekly.columns if str(c).lower() in ("team","recent_team","recent_team_abbr")), None)
-    if tcol is None:
-        st.error("Could not find team column in weekly data.")
-        return
-    wcol = next((c for c in weekly.columns if str(c).lower() == "week"), None)
-    if wcol is None:
-        st.error("Could not find week column in weekly data.")
-        return
-
-    wk_df = weekly[weekly[wcol] == wnum].copy()
-    if wk_df.empty:
-        st.warning(f"No weekly rows for week {wnum} in the imported dataset.")
-        return
-
-    def agg_off(team_code):
-        df = wk_df[wk_df[tcol].astype(str).str.upper() == team_code]
-        if df.empty:
-            return None
-        out = {}
-        for field, alias in [
-            ("passing_yards", "PassYds"),
-            ("rushing_yards", "RushYds"),
-            ("receiving_yards", "RecvYds"),
-            ("passing_tds", "PassTD"),
-            ("rushing_tds", "RushTD"),
-            ("targets", "Targets"),
-            ("receptions", "Recs"),
-            ("sacks", "SacksAgainst"),
-        ]:
-            if field in df.columns:
-                out[alias] = pd.to_numeric(df[field], errors="coerce").fillna(0).sum()
-        return pd.DataFrame([{
-            "Week": week_code,
-            "Opponent": opp_code if team_code == "CHI" else "CHI",
-            "Team": team_code,
-            **out
-        }])
-
-    off_frames = [agg_off(t) for t in ("CHI", opp_code)]
-    off_frames = [f for f in off_frames if f is not None]
-    if off_frames:
-        off_df = pd.concat(off_frames, ignore_index=True)
-        append_to_sheet(off_df, SHEETS["offense"], dedup_cols=["Week","Opponent","Team"])
-        st.success(f"Fetched NFL team offense snapshot for {week_code} (rows: {len(off_df)}).")
+    if not os.path.exists(path):
+        init_workbook(path)
+    wb = openpyxl.load_workbook(path)
+    if sheet_name not in wb.sheetnames:
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(df_new.columns.tolist())
     else:
-        st.info("No offense rows aggregated for this week/teams.")
+        ws = wb[sheet_name]
 
-    def agg_def(team_code):
-        df = wk_df[wk_df[tcol].astype(str).str.upper() == team_code]
-        if df.empty:
-            return None
-        out = {}
-        for field, alias in [
-            ("solo_tackles", "SoloTk"),
-            ("assisted_tackles", "AstTk"),
-            ("sacks", "Sacks"),
-            ("interceptions", "INT"),
-            ("forced_fumbles", "FF"),
-            ("fumbles_recovered", "FR"),
-            ("passes_defended", "PD"),
-        ]:
-            if field in df.columns:
-                out[alias] = pd.to_numeric(df[field], errors="coerce").fillna(0).sum()
-        return pd.DataFrame([{
-            "Week": week_code,
-            "Opponent": opp_code if team_code == "CHI" else "CHI",
-            "Team": team_code,
-            **out
-        }])
-
-    def_frames = [agg_def(t) for t in ("CHI", opp_code)]
-    def_frames = [f for f in def_frames if f is not None]
-    if def_frames:
-        def_df = pd.concat(def_frames, ignore_index=True)
-        append_to_sheet(def_df, SHEETS["defense"], dedup_cols=["Week","Opponent","Team"])
-        st.success(f"Fetched NFL team defense snapshot for {week_code} (rows: {len(def_df)}).")
+    # Read existing sheet to DataFrame
+    data = list(ws.values)
+    if len(data) == 0:
+        existing = pd.DataFrame(columns=df_new.columns)
     else:
-        st.info("Defense stats not available in your weekly schema; upload defense CSV if needed.")
+        header = list(data[0])
+        rows = data[1:]
+        existing = pd.DataFrame(rows, columns=header)
 
-def fetch_snap_counts_auto(week_code: str, opp_code: str, season_year: int):
-    """Import snap counts -> (Week, Opponent, Player, Snaps, Snap%, Side). Falls back to season-1."""
-    if not NFL_OK:
-        st.error("nfl_data_py not available. Please install/update it or upload Snap Counts CSV.")
-        return
-    try:
-        wnum = int(str(week_code).lstrip("Ww"))
-    except Exception:
-        st.error(f"Could not parse week: {week_code}")
-        return
+    # Ensure consistent columns
+    all_cols = list(dict.fromkeys(list(existing.columns) + list(df_new.columns)))
+    existing = existing.reindex(columns=all_cols)
+    df_new = df_new.reindex(columns=all_cols)
 
-    for yr in (season_year, season_year - 1):
-        snap_df = _try_import_snaps(yr)
-        if snap_df is not None and not snap_df.empty:
-            _build_snaps_from_df(snap_df, wnum, week_code, opp_code)
-            if yr != season_year:
-                st.warning(f"No snap data for {season_year}; fetched from {yr} instead.")
-            return
-    st.error("No snap counts found for the selected season (and prior). Upload a snap CSV instead.")
+    # Normalize keys
+    for k in key_cols:
+        if k in existing.columns:
+            existing[k] = existing[k].astype(str)
+        if k in df_new.columns:
+            df_new[k] = df_new[k].astype(str)
 
-def _build_snaps_from_df(snap_df, wnum, week_code, opp_code):
-    def find_col(dframe, options):
-        return next((c for c in dframe.columns if str(c).lower() in [o.lower() for o in options]), None)
+    # Drop duplicates in existing
+    if all(k in existing.columns for k in key_cols):
+        existing = existing.drop_duplicates(subset=key_cols, keep="last")
 
-    tcol = find_col(snap_df, ["team","recent_team","recent_team_abbr"])
-    ocol = find_col(snap_df, ["opponent","opp","opponent_team","opponent_abbr"])
-    wcol = find_col(snap_df, ["week","wk"])
-    pcol = find_col(snap_df, ["player","player_name","full_name"])
-    snaps_cols = [c for c in snap_df.columns if str(c).lower() in
-                  ("snaps","offense_snaps","defense_snaps","st_snaps","total_snaps")]
-    pct_off = find_col(snap_df, ["offense_pct","offense_share","off_pct"])
-    pct_def = find_col(snap_df, ["defense_pct","defense_share","def_pct"])
-    pct_st  = find_col(snap_df, ["special_teams_pct","st_pct","special_pct"])
+    # Upsert: remove overlaps, then concat
+    if all(k in df_new.columns for k in key_cols):
+        key_vals = set(tuple(x) for x in df_new[key_cols].to_numpy())
+        if not existing.empty:
+            mask = existing[key_cols].apply(lambda r: tuple(r.values) in key_vals, axis=1)
+            existing = existing.loc[~mask]
+    combined = pd.concat([existing, df_new], ignore_index=True)
 
-    if not (tcol and wcol and pcol):
-        st.error("Unexpected snap counts schema; please upload CSV instead.")
-        return
-
-    filt = snap_df[snap_df[wcol] == wnum].copy()
-    filt = filt[filt[tcol].astype(str).str.upper().isin(["CHI", opp_code])]
-
-    if ocol:
-        filt["Opponent"] = filt[ocol].astype(str).str.upper()
-    else:
-        filt["Opponent"] = np.where(filt[tcol].astype(str).str.upper() == "CHI", opp_code, "CHI")
-
-    def pick_side(row):
-        triples = []
-        if pct_off and pd.notna(row.get(pct_off)): triples.append(("Offense", row[pct_off]))
-        if pct_def and pd.notna(row.get(pct_def)): triples.append(("Defense", row[pct_def]))
-        if pct_st  and pd.notna(row.get(pct_st)):  triples.append(("ST", row[pct_st]))
-        if not triples:
-            return ""
-        try:
-            return max(triples, key=lambda x: (0 if pd.isna(x[1]) else float(x[1])))[0]
-        except Exception:
-            return ""
-
-    side_series = filt.apply(pick_side, axis=1)
-    snaps_col = snaps_cols[0] if snaps_cols else None
-    if not snaps_col:
-        filt["snaps_proxy"] = 0
-        snaps_col = "snaps_proxy"
-
-    out = pd.DataFrame({
-        "Week": [week_code] * len(filt),
-        "Opponent": filt["Opponent"].astype(str).str.upper(),
-        "Player": filt[pcol].astype(str),
-        "Snaps": pd.to_numeric(filt[snaps_col], errors="coerce").fillna(0),
-        "Snap%": pd.to_numeric(
-            filt.get(pct_off, pd.Series([np.nan]*len(filt)))
-        , errors="coerce").fillna(
-            pd.to_numeric(filt.get(pct_def, pd.Series([np.nan]*len(filt))), errors="coerce")
-        ).fillna(
-            pd.to_numeric(filt.get(pct_st, pd.Series([np.nan]*len(filt))), errors="coerce")
-        ),
-        "Side": side_series
-    })
-
-    append_to_sheet(out, SHEETS["snap"], dedup_cols=["Week","Opponent","Player"])
-    st.success(f"Fetched snap counts for {week_code} vs {opp_code}: {len(out)} rows.")
-
-# Trigger auto-fetch if buttons pressed
-if auto_nfl_btn:
-    fetch_nfl_data_auto(week, opponent, season)
-if auto_snaps_btn:
-    fetch_snap_counts_auto(week, opponent, season)
-
-# ================== 1) Weekly Notes ==================
-st.markdown("### 1) Weekly Notes")
-with st.expander("Notes"):
-    note_text = st.text_area("Notes", height=110, placeholder="Key matchups, weather, personnel notes…")
-    if st.button("Save Notes"):
-        row = pd.DataFrame([{"Week": week, "Opponent": opponent, "Notes": note_text.strip()}])
-        append_to_sheet(row, SHEETS["notes"], dedup_cols=["Week","Opponent"])
-        st.success("Notes saved.")
-
-# ================== 2) Upload Weekly Data ==================
-st.markdown("### 2) Upload Weekly Data")
-c1, c2 = st.columns(2)
-
-with c1:
-    st.subheader("Offense (.csv/.cvs/.xlsx)")
-    st.caption("Headers can vary; app detects Week/Opponent. Example: Week,Opponent,Points,Yards,YPA,CMP% …")
-    f = st.file_uploader("Upload Offense", type=["csv","cvs","xlsx","xls"], key="off_upl")
-    if f:
-        try:
-            df = read_any_table(f)
-            try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception:
-                df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
-            for w in warns: st.info(w)
-            append_to_sheet(df, SHEETS["offense"], dedup_cols=["Week","Opponent"])
-            st.success(f"Offense rows saved: {len(df)}")
-        except Exception as e:
-            st.error(f"Offense upload failed: {e}")
-
-    st.subheader("Defense (.csv/.cvs/.xlsx)")
-    st.caption("Example: Week,Opponent,SACK,INT,3D%_Allowed,RZ%_Allowed,Pressures …")
-    f = st.file_uploader("Upload Defense", type=["csv","cvs","xlsx","xls"], key="def_upl")
-    if f:
-        try:
-            df = read_any_table(f)
-            try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception:
-                df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
-            for w in warns: st.info(w)
-            append_to_sheet(df, SHEETS["defense"], dedup_cols=["Week","Opponent"])
-            st.success(f"Defense rows saved: {len(df)}")
-        except Exception as e:
-            st.error(f"Defense upload failed: {e}")
-
-with c2:
-    st.subheader("Personnel (.csv/.cvs/.xlsx)")
-    st.info("Personnel: Week,Opponent,11,12,13,21,Other | Snap_Counts: Week,Opponent,Player,Snaps,Snap%,Side.")
-    f = st.file_uploader("Upload Personnel", type=["csv","cvs","xlsx","xls"], key="per_upl")
-    if f:
-        try:
-            df = read_any_table(f)
-            try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception:
-                df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
-            for w in warns: st.info(w)
-            append_to_sheet(df, SHEETS["personnel"], dedup_cols=["Week","Opponent"])
-            st.success(f"Personnel rows saved: {len(df)}")
-        except Exception as e:
-            st.error(f"Personnel upload failed: {e}")
-
-    st.subheader("Snap Counts (.csv/.cvs/.xlsx)")
-    st.caption("Columns include: Week,Opponent,Player,Snaps,Snap%,Side")
-    f = st.file_uploader("Upload Snap Counts", type=["csv","cvs","xlsx","xls"], key="snap_upl")
-    if f:
-        try:
-            df = read_any_table(f)
-            try:
-                df, warns = ensure_week_opp(df, fallback_week=week, fallback_opp=opponent, force_fill_if_missing=fill_missing)
-            except Exception:
-                df["Week"] = week; df["Opponent"] = opponent; warns = [f"Filled Week/Opponent from sidebar ({week}, {opponent})."]
-            for w in warns: st.info(w)
-            if "Player" in df.columns:
-                df["Player"] = df["Player"].astype(str).str.strip()
-            append_to_sheet(df, SHEETS["snap"], dedup_cols=["Week","Opponent","Player"])
-            st.success(f"Snap Count rows saved: {len(df)}")
-        except Exception as e:
-            st.error(f"Snap upload failed: {e}")
-
-# ================== 3) Opponent / Injuries / Media / Strategy ==================
-st.markdown("### 3) Opponent Preview / Injuries / Media / Strategy")
-a, b, c, d = st.columns(4)
-
-with a:
-    st.subheader("Opponent Preview")
-    opp_off = st.text_area("Offense Summary", height=110)
-    opp_def = st.text_area("Defense Summary", height=110)
-    opp_match = st.text_area("Key Matchups", height=110)
-    if st.button("Save Opponent Preview"):
-        row = pd.DataFrame([{
-            "Week": week, "Opponent": opponent,
-            "Off_Summary": opp_off.strip(),
-            "Def_Summary": opp_def.strip(),
-            "Matchups": opp_match.strip()
-        }])
-        append_to_sheet(row, SHEETS["opp"], dedup_cols=["Week","Opponent"])
-        st.success("Opponent preview saved.")
-
-with b:
-    st.subheader("Injuries")
-    p = st.text_input("Player")
-    s = st.selectbox("Status", ["Questionable","Doubtful","Out","IR","Healthy"])
-    bp = st.text_input("Body Part / Injury")
-    prac = st.text_input("Practice (DNP/Limited/Full)")
-    gstat = st.text_input("Game Status")
-    notes = st.text_area("Notes", height=90)
-    if st.button("Save Injury"):
-        if p.strip():
-            row = pd.DataFrame([{
-                "Week": week, "Opponent": opponent,
-                "Player": p.strip(), "Status": s, "BodyPart": bp.strip(),
-                "Practice": prac.strip(), "GameStatus": gstat.strip(), "Notes": notes.strip()
-            }])
-            append_to_sheet(row, SHEETS["inj"], dedup_cols=["Week","Opponent","Player"])
-            st.success("Injury saved.")
-        else:
-            st.error("Enter a player name.")
-
-with c:
-    st.subheader("Media Summaries")
-    src = st.text_input("Source")
-    summ = st.text_area("Summary", height=140)
-    if st.button("Save Media Summary"):
-        if src.strip() and summ.strip():
-            row = pd.DataFrame([{
-                "Week": week, "Opponent": opponent,
-                "Source": src.strip(), "Summary": summ.strip()
-            }])
-            append_to_sheet(row, SHEETS["media"])
-            st.success("Media summary saved.")
-        else:
-            st.error("Enter both Source and Summary.")
-
-with d:
-    st.subheader("Weekly Strategy")
-    plan = st.text_area("Plan (headline)", height=70)
-    keys = st.text_area("Keys (bullets ok)", height=70)
-    strat_notes = st.text_area("Notes", height=70)
-    if st.button("Save Strategy"):
-        row = pd.DataFrame([{
-            "Week": week, "Opponent": opponent,
-            "Plan": plan.strip(), "Keys": keys.strip(), "Notes": strat_notes.strip()
-        }])
-        append_to_sheet(row, SHEETS["strategy"], dedup_cols=["Week","Opponent"])
-        st.success("Strategy saved.")
-
-# ================== 4) Prediction ==================
-st.markdown("### 4) Prediction")
-x, y = st.columns(2)
-with x:
-    who = st.selectbox("Predicted Winner", ["CHI","OPP"], index=0)
-    conf = st.slider("Confidence", 0, 100, 60)
-with y:
-    why = st.text_area("Rationale", height=120)
-if st.button("Save Prediction"):
-    row = pd.DataFrame([{
-        "Week": week, "Opponent": opponent,
-        "Predicted_Winner": "CHI" if who == "CHI" else opponent,
-        "Confidence": conf,
-        "Rationale": why.strip()
-    }])
-    append_to_sheet(row, SHEETS["pred"], dedup_cols=["Week","Opponent"])
-    st.success("Prediction saved.")
-
-# ================== Current-week package & downloads ==================
-def build_week_package(week_code: str, opp_code: str) -> dict:
-    pkg = {}
-    for sheet_name in SHEETS.values():
-        df = read_sheet(sheet_name)
-        if df.empty:
-            pkg[sheet_name] = df
-            continue
-        if {"Week","Opponent"}.issubset(df.columns):
-            m = (df["Week"].astype(str) == week_code) & (df["Opponent"].astype(str).str.upper() == opp_code)
-            pkg[sheet_name] = df[m].copy()
-        else:
-            pkg[sheet_name] = df.copy()
-    return pkg
-
-def _excel_apply_colors(path: Path):
-    """Auto-fit + heat/color bars for numeric columns."""
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.utils import get_column_letter
-        from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
-    except Exception:
-        return
-
-    wb = load_workbook(filename=path)
-    three_color = ColorScaleRule(
-        start_type='min', start_color='F8696B',
-        mid_type='percentile', mid_value=50, mid_color='FFEB84',
-        end_type='max', end_color='63BE7B'
-    )
-    data_bar = DataBarRule(start_type="num", start_value=0, end_type="max", end_value=0, color="63BE7B", showValue="None")
-
-    for ws in wb.worksheets:
-        max_col = ws.max_column
-        max_row = ws.max_row
-        if max_row < 2:
-            continue
-
-        headers = {c: (ws.cell(1, c).value if ws.cell(1, c).value is not None else f"Col{c}") for c in range(1, max_col+1)}
-        text_like = {"Week","Opponent","Team","Player","Side","Source","Summary","Notes","Rationale","Plan","Keys","Matchups","Off_Summary","Def_Summary"}
-
-        from openpyxl.utils import get_column_letter
-        for c in range(1, max_col+1):
-            col_letter = get_column_letter(c)
-            max_len = len(str(headers[c]))
-            for r in range(2, max_row+1):
-                v = ws.cell(r, c).value
-                if v is None: continue
-                s = str(v)
-                if len(s) > max_len:
-                    max_len = len(s)
-            ws.column_dimensions[col_letter].width = min(50, max(10, max_len + 2))
-
-        for c in range(1, max_col+1):
-            header = str(headers[c])
-            if header in text_like:
-                continue
-            numeric = False
-            for r in range(2, min(max_row, 25)+1):
-                v = ws.cell(r, c).value
-                if isinstance(v, (int, float)) and v is not None:
-                    numeric = True
-                    break
-            if not numeric:
-                continue
-            col_letter = get_column_letter(c)
-            ws.conditional_formatting.add(f"{col_letter}2:{col_letter}{max_row}", three_color)
-
-        if ws.title == "Snap_Counts":
-            col_snaps = None
-            col_pct = None
-            for c in range(1, max_col+1):
-                h = str(headers[c]).strip().lower()
-                if h == "snaps":
-                    col_snaps = c
-                if h in ("snap%", "snap_pct", "snappercent", "snapperc"):
-                    col_pct = c
-            if col_snaps:
-                L = get_column_letter(col_snaps)
-                ws.conditional_formatting.add(f"{L}2:{L}{max_row}", data_bar)
-            if col_pct:
-                L = get_column_letter(col_pct)
-                ws.conditional_formatting.add(f"{L}2:{L}{max_row}", data_bar)
+    # Clear and write back
+    ws.delete_rows(1, ws.max_row)
+    ws.append(combined.columns.tolist())
+    for _, row in combined.iterrows():
+        ws.append(row.tolist())
 
     wb.save(path)
 
-# ---------- PDF export (sanitized for latin-1) ----------
-def export_week_pdf(pkg: dict, path: Path, title: str):
-    from fpdf import FPDF
 
-    def sanitize(s):
-        if s is None:
-            return ""
-        if not isinstance(s, str):
-            s = str(s)
-        s = (s.replace("—", "-").replace("–", "-").replace("…", "...")
-               .replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
-               .replace("\u00A0", " "))
-        try:
-            s.encode("latin-1")
-            return s
-        except UnicodeEncodeError:
-            return s.encode("latin-1", "ignore").decode("latin-1")
+# -----------------------------
+# NFL Fetch + Averages
+# -----------------------------
 
-    pdf = FPDF(orientation="P", unit="mm", format="Letter")
-    pdf.set_auto_page_break(auto=True, margin=15)
+def fetch_week_stats(team: str, opponent: str, week_int: int, season: int) -> Dict[str, float]:
+    """Attempt to fetch team+week stats using nfl_data_py. Returns a dict of metrics.
+    We keep this tolerant: if library/columns differ, we just return what we can.
+    """
+    result = {}
+    if nfl is None:
+        st.warning("nfl_data_py not installed; cannot auto-fetch NFL data.")
+        return result
+    try:
+        # nflfastR weekly data (play-by-play derived). Using weekly is more stable than schedules.
+        weekly = nfl.import_weekly_data([season])  # can be large; filtered next
+        # Normalize team abbreviations
+        df = weekly.copy()
+        # Columns differ across versions; try common patterns
+        # Filter for team & week
+        if "team" in df.columns:
+            df_team = df[(df["team"].str.upper()==team.upper()) & (df["week"]==week_int)]
+        elif "posteam" in df.columns:
+            df_team = df[(df["posteam"].str.upper()==team.upper()) & (df["week"]==week_int)]
+        else:
+            df_team = df[df.get("week", pd.Series(dtype=int))==week_int]
 
-    def H(t):
-        pdf.set_font("Arial", "B", 14)
-        pdf.cell(0, 10, sanitize(t), ln=True)
+        if df_team.empty:
+            st.info("No rows found for team/week in weekly dataset; data may not be published yet.")
+            return result
 
-    def P(t):
-        pdf.set_font("Arial", "", 11)
-        txt = sanitize(t) if t else "-"
-        pdf.multi_cell(0, 6, txt)
+        # Aggregate common metrics (best-effort)
+        # Try both snake_case and alt names
+        def first_available(row: pd.Series, names: List[str]):
+            for n in names:
+                if n in row and pd.notna(row[n]):
+                    return row[n]
+            return pd.NA
 
+        # Use sums/means where appropriate
+        # Passing yards
+        result["PassYds"] = float(df_team.get("passing_yards", pd.Series(dtype=float)).sum() or 0)
+        if result["PassYds"] == 0 and "pass_yards" in df_team:
+            result["PassYds"] = float(df_team["pass_yards"].sum())
+
+        result["RushYds"] = float(df_team.get("rushing_yards", pd.Series(dtype=float)).sum() or 0)
+        if result["RushYds"] == 0 and "rush_yards" in df_team:
+            result["RushYds"] = float(df_team["rush_yards"].sum())
+
+        result["PassTD"] = float(df_team.get("passing_tds", pd.Series(dtype=float)).sum() or 0)
+        result["RushTD"] = float(df_team.get("rushing_tds", pd.Series(dtype=float)).sum() or 0)
+
+        # Sacks against (offense): sacks taken often stored as sacks, positive is defensive sacks.
+        if "sacks" in df_team:
+            # If positive means sacks by defense, sacks against offense is negative of own sacks? Use abs total for week.
+            result["SacksAgainst"] = float(abs(df_team["sacks"].sum()))
+        else:
+            result["SacksAgainst"] = 0.0
+
+        # Completions/Attempts for YPA & CMP%
+        comp = df_team.get("completions", pd.Series(dtype=float)).sum() if "completions" in df_team else None
+        att = df_team.get("attempts", pd.Series(dtype=float)).sum() if "attempts" in df_team else None
+        if att and att != 0:
+            result["YPA"] = float(result["PassYds"]/att)
+            result["CMP%"] = float((comp/att)*100) if comp is not None else pd.NA
+        else:
+            result["YPA"] = pd.NA
+            result["CMP%"] = pd.NA
+
+        # Basic placeholders if data not present in that dataset
+        result.setdefault("RecvYds", result.get("PassYds", 0))
+        result.setdefault("Points", pd.NA)
+        result.setdefault("Turnovers", pd.NA)
+        result.setdefault("YAC", pd.NA)
+        result.setdefault("Targets", pd.NA)
+        result.setdefault("Recs", comp if comp is not None else pd.NA)
+        result.setdefault("1D", pd.NA)
+        result.setdefault("Total_YDS", (result.get("PassYds",0) + result.get("RushYds",0)))
+        result.setdefault("QBR", pd.NA)
+        result.setdefault("SR%", pd.NA)
+        result.setdefault("EPA", pd.NA)
+        result.setdefault("DVOA", pd.NA)
+        result.setdefault("Red_Zone%", pd.NA)
+        result.setdefault("3rd_Down_Conv%", pd.NA)
+        result.setdefault("Expl_Plays (20+)", pd.NA)
+
+        # Defense — derive limited items if possible (these are tricky from weekly team table)
+        result_def = {
+            "Sacks": pd.NA,
+            "QB_Hits": pd.NA,
+            "Pressures": pd.NA,
+            "INT": pd.NA,
+            "Turnovers": pd.NA,
+            "FF": pd.NA,
+            "FR": pd.NA,
+            "3rd_Down%_Allowed": pd.NA,
+            "RZ%_Allowed": pd.NA,
+            "YdsAllowed_Pass": pd.NA,
+            "YdsAllowed_Rush": pd.NA,
+            "PointsAllowed": pd.NA,
+        }
+        result.update({f"DEF__{k}": v for k,v in result_def.items()})
+
+    except Exception as e:
+        st.warning(f"NFL fetch failed: {e}")
+    return result
+
+
+def compute_nfl_averages_for_week(week_int: int, season: int) -> Dict[str, float]:
+    """Compute league averages for a subset of metrics. Returns mapping for NFL_Avg._* columns."""
+    averages = {}
+    if nfl is None:
+        return averages
+    try:
+        weekly = nfl.import_weekly_data([season])
+        dfw = weekly[weekly["week"] == week_int]
+        if dfw.empty:
+            return averages
+        # Basic league averages (best-effort based on available columns)
+        if "passing_yards" in dfw:
+            averages["NFL_Avg._PassYds"] = float(dfw["passing_yards"].mean())
+        if "rushing_yards" in dfw:
+            averages["NFL_Avg._RushYds"] = float(dfw["rushing_yards"].mean())
+        if "passing_tds" in dfw:
+            averages["NFL_Avg._PassTD"] = float(dfw["passing_tds"].mean())
+        if "rushing_tds" in dfw:
+            averages["NFL_Avg._RushTD"] = float(dfw["rushing_tds"].mean())
+        # Placeholders for others (left NaN if not computed here)
+        for col in OFF_EXPANDED_COLS:
+            if col.startswith("NFL_Avg._") and col not in averages:
+                averages[col] = pd.NA
+        for col in DEF_EXPANDED_COLS:
+            if col.startswith("NFL_Avg._") and col not in averages:
+                averages[col] = pd.NA
+    except Exception as e:
+        st.info(f"Could not compute NFL averages: {e}")
+    return averages
+
+
+def fill_nfl_avg_columns(df: pd.DataFrame, avg_map: Dict[str, float]) -> pd.DataFrame:
+    for k, v in avg_map.items():
+        if k in df.columns and df[k].isna().all():
+            df[k] = v
+    return df
+
+
+# -----------------------------
+# Sidebar Controls
+# -----------------------------
+with st.sidebar:
+    st.header("Controls")
+    week_input = st.text_input("Week (e.g., W01)", value="W01")
+    try:
+        week_int = int(week_input.replace("W",""))
+    except Exception:
+        week_int = 1
+    opponent_input = st.selectbox("Opponent (3‑letter)", options=OPPONENTS, index=max(0, OPPONENTS.index("MIN") if "MIN" in OPPONENTS else 0))
+    st.caption(f"Season assumed: {CURRENT_SEASON}")
+
+    st.subheader("Data Operations")
+    fetch_btn = st.button("Fetch NFL Data (Auto)")
+    compute_avg_btn = st.button("Compute NFL Averages")
+
+    st.subheader("Exports")
+    pre_xls_btn = st.button("Export Week Excel (Pre/Post)")
+    final_pdf_btn = st.button("Export Final PDF")
+
+# Ensure workbook exists
+init_workbook(DATA_FILE)
+
+# -----------------------------
+# Main Page — Uploaders & Live Views
+# -----------------------------
+st.markdown("### Weekly Uploads")
+cols = st.columns(4)
+
+with cols[0]:
+    off_file = st.file_uploader("Upload Offense CSV", type=["csv"], key="off_up")
+with cols[1]:
+    def_file = st.file_uploader("Upload Defense CSV", type=["csv"], key="def_up")
+with cols[2]:
+    per_file = st.file_uploader("Upload Personnel CSV", type=["csv"], key="per_up")
+with cols[3]:
+    sc_file = st.file_uploader("Upload Snap Counts CSV", type=["csv"], key="sc_up")
+
+# Process uploads
+if off_file is not None:
+    df_off = pd.read_csv(off_file)
+    df_off = ensure_columns(df_off, OFF_EXPANDED_COLS)
+    df_off = clean_df(df_off, opponent_input, team="CHI")
+    upsert_sheet(DATA_FILE, "Offense", df_off)
+    st.success(f"Offense rows saved: {len(df_off)}")
+
+if def_file is not None:
+    df_def = pd.read_csv(def_file)
+    df_def = ensure_columns(df_def, DEF_EXPANDED_COLS)
+    df_def = clean_df(df_def, opponent_input, team="CHI")
+    upsert_sheet(DATA_FILE, "Defense", df_def)
+    st.success(f"Defense rows saved: {len(df_def)}")
+
+if per_file is not None:
+    df_per = pd.read_csv(per_file)
+    df_per = ensure_columns(df_per, PERSONNEL_COLS)
+    df_per = clean_df(df_per, opponent_input, team="CHI")
+    upsert_sheet(DATA_FILE, "Personnel", df_per)
+    st.success(f"Personnel rows saved: {len(df_per)}")
+
+if sc_file is not None:
+    df_sc = pd.read_csv(sc_file)
+    df_sc = ensure_columns(df_sc, SNAPCOUNTS_COLS)
+    df_sc = clean_df(df_sc, opponent_input, team="CHI")
+    upsert_sheet(DATA_FILE, "Snap_Counts", df_sc)
+    st.success(f"Snap Counts rows saved: {len(df_sc)}")
+
+# -----------------------------
+# Fetch + Merge
+# -----------------------------
+if fetch_btn:
+    stats = fetch_week_stats(team="CHI", opponent=opponent_input, week_int=week_int, season=CURRENT_SEASON)
+    if stats:
+        # Build DataFrame for Offense with current identifiers
+        off_row = {c: pd.NA for c in OFF_EXPANDED_COLS}
+        off_row.update({
+            "Week": week_input,
+            "Opponent": opponent_input,
+            "Team": "CHI",
+        })
+        for k,v in stats.items():
+            if k in OFF_EXPANDED_COLS:
+                off_row[k] = v
+        df_off = pd.DataFrame([off_row])
+
+        # Minimal Defense row placeholder (fetch fills limited defensive metrics by default)
+        def_row = {c: pd.NA for c in DEF_EXPANDED_COLS}
+        def_row.update({"Week": week_input, "Opponent": opponent_input, "Team": "CHI"})
+        for k,v in stats.items():
+            if k.startswith("DEF__"):
+                key = k.replace("DEF__", "")
+                if key in DEF_EXPANDED_COLS:
+                    def_row[key] = v
+        df_def = pd.DataFrame([def_row])
+
+        # Compute and apply NFL averages if requested afterwards
+        upsert_sheet(DATA_FILE, "Offense", df_off)
+        upsert_sheet(DATA_FILE, "Defense", df_def)
+        st.success("Fetched NFL weekly data and merged into Excel (Offense/Defense).")
+    else:
+        st.warning("No NFL data merged (library missing or data not yet available).")
+
+# -----------------------------
+# Compute NFL Averages (fills NFL_Avg._* columns when empty)
+# -----------------------------
+if compute_avg_btn:
+    avg_map = compute_nfl_averages_for_week(week_int=week_int, season=CURRENT_SEASON)
+    if not avg_map:
+        st.info("Could not compute NFL averages (library missing or data unavailable).")
+    else:
+        # Read, fill, and write back Offense/Defense
+        if openpyxl is not None and os.path.exists(DATA_FILE):
+            wb = openpyxl.load_workbook(DATA_FILE)
+            for sheet_name in ["Offense","Defense","Personnel"]:
+                if sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    data = list(ws.values)
+                    if not data:
+                        continue
+                    header = list(data[0])
+                    rows = data[1:]
+                    df = pd.DataFrame(rows, columns=header)
+                    df = fill_nfl_avg_columns(df, avg_map)
+                    # write back
+                    ws.delete_rows(1, ws.max_row)
+                    ws.append(df.columns.tolist())
+                    for _, r in df.iterrows():
+                        ws.append(r.tolist())
+            wb.save(DATA_FILE)
+            st.success("NFL averages filled where empty.")
+        else:
+            st.info("Excel not available to update.")
+
+# -----------------------------
+# Live Previews
+# -----------------------------
+st.markdown("### Live Data Preview (current Excel)")
+if openpyxl is not None and os.path.exists(DATA_FILE):
+    wb = openpyxl.load_workbook(DATA_FILE)
+    tabs = st.tabs([s for s,_ in SHEET_ORDER])
+    for tab, (sheet_name, _) in zip(tabs, SHEET_ORDER):
+        with tab:
+            ws = wb[sheet_name]
+            data = list(ws.values)
+            if not data:
+                st.write("(empty)")
+            else:
+                header = list(data[0])
+                rows = data[1:]
+                df = pd.DataFrame(rows, columns=header)
+                st.dataframe(df, width="stretch")
+else:
+    st.info("Excel not found yet; upload a CSV or fetch to create it.")
+
+# -----------------------------
+# Exports
+# -----------------------------
+
+def export_week_excel(week_str: str, opponent: str) -> str:
+    """Save a per-week Excel with key sheets filtered to the chosen week/opponent."""
+    if openpyxl is None or not os.path.exists(DATA_FILE):
+        st.error("Excel engine not available or data file missing.")
+        return ""
+    wb = openpyxl.load_workbook(DATA_FILE)
+    out_path = os.path.join(EXPORTS_DIR, f"{week_str}_{opponent}.xlsx")
+    out_wb = openpyxl.Workbook()
+    out_wb.remove(out_wb.active)
+
+    for sheet_name, _ in SHEET_ORDER[:4]:  # Offense/Defense/Personnel/Snap_Counts
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            data = list(ws.values)
+            if not data:
+                continue
+            header = list(data[0])
+            rows = data[1:]
+            df = pd.DataFrame(rows, columns=header)
+            if all(c in df.columns for c in ["Week","Opponent"]):
+                df = df[(df["Week"]==week_str) & (df["Opponent"]==opponent)]
+            ws_out = out_wb.create_sheet(title=sheet_name)
+            ws_out.append(df.columns.tolist())
+            for _, r in df.iterrows():
+                ws_out.append(r.tolist())
+
+    out_wb.save(out_path)
+    return out_path
+
+
+def export_final_pdf(week_str: str, opponent: str) -> str:
+    if FPDF is None:
+        st.error("FPDF not installed; cannot create PDF.")
+        return ""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, sanitize(title.replace("—", "-")), ln=True)
-    pdf.ln(4)
+    pdf.set_font("Arial", style="B", size=16)
+    pdf.cell(0, 10, f"Chicago Bears — Week {week_str.replace('W','')} vs {opponent}", ln=True)
 
-    H("Weekly Notes")
-    n = pkg.get(SHEETS["notes"], pd.DataFrame())
-    P(str(n["Notes"].iloc[0]) if not n.empty and "Notes" in n.columns else "")
+    def add_section(title: str, df: pd.DataFrame):
+        pdf.set_font("Arial", style="B", size=12)
+        pdf.cell(0, 8, title, ln=True)
+        pdf.set_font("Arial", size=9)
+        if df.empty:
+            pdf.cell(0, 6, "(no data)", ln=True)
+            return
+        # Simple table
+        col_w = max(25, pdf.w / max(6, len(df.columns)))
+        # header
+        for c in df.columns:
+            pdf.cell(col_w, 6, str(c)[:18], border=1)
+        pdf.ln(6)
+        # rows
+        for _, r in df.iterrows():
+            for c in df.columns:
+                pdf.cell(col_w, 6, str(r[c])[:18], border=1)
+            pdf.ln(6)
+        pdf.ln(2)
 
-    pdf.ln(3); H("Opponent Preview")
-    o = pkg.get(SHEETS["opp"], pd.DataFrame())
-    if not o.empty:
-        P("Offense: " + str(o.get("Off_Summary", pd.Series([""])).iloc[0]))
-        P("Defense: " + str(o.get("Def_Summary", pd.Series([""])).iloc[0]))
-        P("Matchups: " + str(o.get("Matchups", pd.Series([""])).iloc[0]))
-    else:
-        P("")
+    # Pull filtered frames from Excel
+    if openpyxl is not None and os.path.exists(DATA_FILE):
+        wb = openpyxl.load_workbook(DATA_FILE)
+        for sheet_name in ["Offense","Defense","Personnel","Snap_Counts"]:
+            if sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                data = list(ws.values)
+                if not data:
+                    df = pd.DataFrame()
+                else:
+                    header = list(data[0])
+                    rows = data[1:]
+                    df = pd.DataFrame(rows, columns=header)
+                    if all(c in df.columns for c in ["Week","Opponent"]):
+                        df = df[(df["Week"]==week_str) & (df["Opponent"]==opponent)]
+                add_section(sheet_name, df)
 
-    pdf.ln(3); H("Weekly Strategy")
-    s = pkg.get(SHEETS["strategy"], pd.DataFrame())
-    if not s.empty:
-        P("Plan: " + str(s.get("Plan", pd.Series([""])).iloc[0]))
-        P("Keys: " + str(s.get("Keys", pd.Series([""])).iloc[0]))
-        P("Notes: " + str(s.get("Notes", pd.Series([""])).iloc[0]))
-    else:
-        P("")
+    out_path = os.path.join(EXPORTS_DIR, f"{week_str}_{opponent}_Final.pdf")
+    pdf.output(out_path)
+    return out_path
 
-    pdf.ln(3); H("Injuries")
-    inj = pkg.get(SHEETS["inj"], pd.DataFrame())
-    if not inj.empty:
-        for _, r in inj.iterrows():
-            P(f"{r.get('Player','')} - {r.get('Status','')} - {r.get('BodyPart','')}; "
-              f"Practice: {r.get('Practice','')}; Game: {r.get('GameStatus','')}; "
-              f"Notes: {r.get('Notes','')}")
-    else:
-        P("")
 
-    pdf.ln(3); H("Media Summaries")
-    med = pkg.get(SHEETS["media"], pd.DataFrame())
-    if not med.empty:
-        for _, r in med.iterrows():
-            P(f"{r.get('Source','')}: {r.get('Summary','')}")
-    else:
-        P("")
+# Buttons wiring
+if pre_xls_btn:
+    path = export_week_excel(week_input, opponent_input)
+    if path:
+        st.success(f"Excel exported → {path}")
+        with open(path, "rb") as f:
+            st.download_button("Download Week Excel", data=f, file_name=os.path.basename(path), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    pdf.ln(3); H("Prediction")
-    pr = pkg.get(SHEETS["pred"], pd.DataFrame())
-    if not pr.empty:
-        r = pr.iloc[-1]
-        P(f"Predicted Winner: {r.get('Predicted_Winner','')}")
-        P(f"Confidence: {r.get('Confidence','')}")
-        P("Rationale: " + str(r.get("Rationale","")))
-    else:
-        P("")
+if final_pdf_btn:
+    path = export_final_pdf(week_input, opponent_input)
+    if path:
+        st.success(f"Final PDF exported → {path}")
+        with open(path, "rb") as f:
+            st.download_button("Download Final PDF", data=f, file_name=os.path.basename(path), mime="application/pdf")
 
-    pdf.ln(6); pdf.set_font("Arial", "I", 9)
-    P("Generated by Bears Weekly Tracker")
-    pdf.output(str(path))
 
-def export_week_excel(pkg: dict, path: Path, colorize: bool):
-    with pd.ExcelWriter(path, engine="openpyxl", mode="w") as w:
-        for sheet_name, df in pkg.items():
-            safe = sheet_name[:31]
-            (df if not df.empty else pd.DataFrame()).to_excel(w, index=False, sheet_name=safe)
-    if colorize:
-        _excel_apply_colors(path)
-
-# Downloads
-if btn_xlsx or btn_pdf:
-    pkg = build_week_package(week, opponent)
-    if btn_xlsx:
-        x = CURR_DIR / f"{week}_{opponent}.xlsx"
-        try:
-            export_week_excel(pkg, x, colorize=apply_colors)
-            st.success(f"Saved: {x}")
-            with open(x, "rb") as f:
-                st.download_button("Download Current Week Excel (click to save)", f.read(),
-                                   file_name=x.name,
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.error(f"Excel export failed: {e}")
-    if btn_pdf:
-        p = CURR_DIR / f"{week}_{opponent}.pdf"
-        try:
-            export_week_pdf(pkg, p, title=f"Weekly Report - {week} vs {opponent}")
-            st.success(f"Saved: {p}")
-            with open(p, "rb") as f:
-                st.download_button("Download Current Week PDF (click to save)", f.read(),
-                                   file_name=p.name, mime="application/pdf")
-        except Exception as e:
-            st.error(f"PDF export failed: {e}")
-
-# ================== 5) Search & Snap Finder ==================
-st.markdown("### 5) Search & Snap Finder")
-s1, s2 = st.columns([2,1])
-with s1:
-    st.subheader("Global Search (choose a table)")
-    table_choice = st.selectbox("Table", list(SHEETS.values()),
-                                index=list(SHEETS.values()).index(SHEETS["snap"]))
-    q = st.text_input("Search text (matches anywhere in the selected table)", "")
-    df = read_sheet(table_choice)
-    if not df.empty and q.strip():
-        qlow = q.strip().lower()
-        mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(qlow, na=False))
-        df = df[mask.any(axis=1)]
-    st.dataframe(df if not df.empty else pd.DataFrame({"Info":["No rows (or no matches)."]}),
-                 width="stretch", hide_index=True)
-
-with s2:
-    st.subheader("Search Snap Counts")
-    snap_df = read_sheet(SHEETS["snap"])
-    player = st.text_input("Player contains…", "")
-    side = st.selectbox("Side", ["(any)","Offense","Defense","ST"], index=0)
-    snap_week = st.selectbox("Snap Week", ["(any)"] + week_options(), index=0)
-    if not snap_df.empty:
-        filt = snap_df.copy()
-        if player.strip():
-            filt = filt[filt["Player"].astype(str).str.contains(player.strip(), case=False, na=False)]
-        if side != "(any)" and "Side" in filt.columns:
-            filt = filt[filt["Side"].astype(str).str.contains(side, case=False, na=False)]
-        if snap_week != "(any)" and "Week" in filt.columns:
-            filt = filt[filt["Week"].astype(str) == snap_week]
-        st.dataframe(filt if not filt.empty else pd.DataFrame({"Info":["No snap rows match."]}),
-                     width="stretch", hide_index=True)
-    else:
-        st.info("No snap data yet. Use auto-fetch or upload.")
-
-# ================== 6) Current Week Snapshots (with Search) ==================
-st.markdown("### 6) Current Week Snapshots (with Search)")
-tabs = st.tabs(["Offense","Defense","Personnel","Snap Counts","Injuries","Media","Opponent","Prediction","Notes","Strategy"])
-
-def show_df(tab, sheet):
-    with tab:
-        colX, colY = st.columns([2,1])
-        with colX:
-            q = st.text_input(f"Search {sheet}", key=f"q_{sheet}", placeholder="Search…")
-        with colY:
-            st.caption("Filters matching rows in this tab.")
-        df = read_sheet(sheet)
-        if not df.empty and {"Week","Opponent"}.issubset(df.columns):
-            df = df[(df["Week"].astype(str) == week) & (df["Opponent"].astype(str).str.upper() == opponent)]
-        if not df.empty and (q or "").strip():
-            qlow = q.strip().lower()
-            mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(qlow, na=False))
-            df = df[mask.any(axis=1)]
-        st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No rows for this week/opponent (or search filtered all)."]}),
-                     width="stretch", hide_index=True)
-
-show_df(tabs[0], SHEETS["offense"])
-show_df(tabs[1], SHEETS["defense"])
-show_df(tabs[2], SHEETS["personnel"])
-show_df(tabs[3], SHEETS["snap"])
-show_df(tabs[4], SHEETS["inj"])
-show_df(tabs[5], SHEETS["media"])
-show_df(tabs[6], SHEETS["opp"])
-show_df(tabs[7], SHEETS["pred"])
-show_df(tabs[8], SHEETS["notes"])
-show_df(tabs[9], SHEETS["strategy"])
-
-st.caption("Master workbook lives in ./data. Current-week downloads save to ./exports/Current_Week. Uploads accept CSV or Excel; .cvs is accepted. Week/Opponent are auto-filled from the sidebar when enabled.")
+st.markdown(
+    """
+---
+**Notes**
+- This revision expands the field mapping and ensures **Week / Opponent / Team** are always set on upload.
+- `Fetch NFL Data` merges a best‑effort set of offensive stats and placeholders for defense; columns are created even if data is missing upstream.
+- `Compute NFL Averages` fills any empty `NFL_Avg._*` columns for the current week where we could compute them.
+- Exports are saved to the `exports/` folder under your repo folder. Use the download buttons to grab them directly.
+- If you want deeper, play‑by‑play metrics (EPA, SR%, pressures), we can wire a second fetch path to merge from play‑by‑play and team‑defense tables.
+"""
+)
