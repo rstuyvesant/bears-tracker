@@ -276,19 +276,23 @@ def fetch_week_stats(team: str, opponent: str, week_int: int, season: int) -> Di
 
     # 2) Fallback: team seasonal summary (per‑game averages) — then take week row if present
     if not result:
-        team_summ = safe_try(nfl.import_seasonal_team_stats, [season])
-        if team_summ is not None and not team_summ.empty:
+        team_summ = None
+        # Guard against older nfl_data_py versions where this function may not exist
+        if hasattr(nfl, 'import_seasonal_team_stats'):
+            team_summ = safe_try(nfl.import_seasonal_team_stats, [season])
+        elif hasattr(nfl, 'import_team_desc'):
+            # Not stats, but confirms team exists; keep as no-op placeholder
+            safe_try(nfl.import_team_desc)
+        if team_summ is not None and hasattr(team_summ, 'empty') and not team_summ.empty:
             df = team_summ.copy()
-            # If a weekly dimension exists, try filter; otherwise leave as placeholder
-            if "team" in df.columns:
-                df_team = df[df["team"].astype(str).str.upper()==team.upper()]
+            if 'team' in df.columns:
+                df_team = df[df['team'].astype(str).str.upper()==team.upper()]
                 if not df_team.empty:
-                    # Use per‑game placeholders so exports have something (better than blank)
                     result.update({
-                        "PassYds": float(df_team.get("pass_yds", pd.Series(dtype=float)).mean() or 0),
-                        "RushYds": float(df_team.get("rush_yds", pd.Series(dtype=float)).mean() or 0),
-                        "PassTD": float(df_team.get("pass_tds", pd.Series(dtype=float)).mean() or 0),
-                        "RushTD": float(df_team.get("rush_tds", pd.Series(dtype=float)).mean() or 0),
+                        'PassYds': float(df_team.get('pass_yds', pd.Series(dtype=float)).mean() or 0),
+                        'RushYds': float(df_team.get('rush_yds', pd.Series(dtype=float)).mean() or 0),
+                        'PassTD': float(df_team.get('pass_tds', pd.Series(dtype=float)).mean() or 0),
+                        'RushTD': float(df_team.get('rush_tds', pd.Series(dtype=float)).mean() or 0),
                     })
 
     # 3) Fallback: schedules/boxscores (if exposed)
@@ -475,6 +479,9 @@ with st.sidebar:
     pre_xls_btn = st.button("Export Week Excel (Pre/Post)")
     final_pdf_btn = st.button("Export Final PDF")
 
+    st.subheader("Display")
+    color_toggle = st.toggle("Enable Color Coding", value=True, key="color_coding")
+
 # Ensure workbook exists
 init_workbook(DATA_FILE)
 
@@ -589,8 +596,73 @@ if compute_avg_btn:
             st.info("Excel not available to update.")
 
 # -----------------------------
-# Live Previews (robust to missing sheets)
+# Live Previews (robust to missing sheets) + Optional Color Coding
 # -----------------------------
+
+def _metric_pairs_for_sheet(sheet_name: str):
+    """Return a tuple (better_high, better_low) where each is a list of metric base names
+    and we will compare to NFL_Avg._<metric> when present."""
+    if sheet_name == "Offense":
+        better_high = [
+            "PassYds","RushYds","RecvYds","PassTD","RushTD","Points","YPA","CMP%","YAC",
+            "Targets","Recs","1D","Total_YDS","QBR","SR%","EPA","DVOA","Red_Zone%","3rd_Down_Conv%","Expl_Plays (20+)"
+        ]
+        better_low = ["Turnovers","SacksAgainst"]
+    elif sheet_name == "Defense":
+        better_high = ["Sacks","QB_Hits","Pressures","INT","Turnovers","FF","FR"]
+        better_low = ["3rd_Down%_Allowed","RZ%_Allowed","YdsAllowed_Pass","YdsAllowed_Rush","PointsAllowed"]
+    elif sheet_name == "Personnel":
+        # No clear "better" here; skip coloring
+        better_high, better_low = [], []
+    else:
+        better_high, better_low = [], []
+    return better_high, better_low
+
+
+def _style_by_nfl_avg(df: pd.DataFrame, sheet_name: str) -> pd.io.formats.style.Styler:
+    better_high, better_low = _metric_pairs_for_sheet(sheet_name)
+    avg_map = {c.replace("NFL_Avg._", ""): c for c in df.columns if c.startswith("NFL_Avg._")}
+
+    def color_cell(val, base):
+        try:
+            v = float(val)
+        except Exception:
+            return ""
+        avg_col = avg_map.get(base)
+        if not avg_col or avg_col not in df.columns:
+            return ""
+        try:
+            a = float(df[avg_col])  # This will error; we need row-wise, so handled in apply
+        except Exception:
+            pass
+        return ""
+
+    def highlight_func(row):
+        styles = [""] * len(row)
+        for i, col in enumerate(df.columns):
+            base = col
+            # Skip identifiers and NFL_Avg columns
+            if base in ("Week","Opponent","Team") or base.startswith("NFL_Avg._"):
+                continue
+            # Match an avg column
+            avg_col = avg_map.get(base)
+            if not avg_col or avg_col not in df.columns:
+                continue
+            try:
+                val = float(row[col])
+                avg = float(row[avg_col])
+            except Exception:
+                continue
+            better_high, better_low = _metric_pairs_for_sheet(sheet_name)
+            if base in better_high:
+                styles[i] = "background-color: #e6ffe6;" if val > avg else "background-color: #ffe6e6;"
+            elif base in better_low:
+                styles[i] = "background-color: #e6ffe6;" if val < avg else "background-color: #ffe6e6;"
+        return styles
+
+    return df.style.apply(highlight_func, axis=1)
+
+
 
 def ensure_sheet_exists(wb, sheet_name: str, cols: List[str]):
     if sheet_name not in wb.sheetnames:
@@ -814,7 +886,15 @@ if openpyxl is not None and os.path.exists(DATA_FILE):
                 header = list(data[0])
                 rows = data[1:]
                 df = pd.DataFrame(rows, columns=header)
-                st.dataframe(df, width='stretch')
+                
+                if 'color_toggle' in st.session_state and st.session_state['color_coding'] and sheet_name in ['Offense','Defense','Personnel']:
+                    try:
+                        st.dataframe(_style_by_nfl_avg(df, sheet_name), width='stretch')
+                    except Exception:
+                        st.dataframe(df, width='stretch')
+                else:
+                    st.dataframe(df, width='stretch')
+
 else:
     st.info("Excel not found yet; upload a CSV or fetch to create it.")
 
