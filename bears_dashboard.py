@@ -599,6 +599,199 @@ def ensure_sheet_exists(wb, sheet_name: str, cols: List[str]):
         return ws_new
     return wb[sheet_name]
 
+# Step index for quick reference
+st.markdown(
+    """
+**Sections (this page renders in this order):**
+1) Weekly Controls  
+2) Upload Weekly Files (Offense, Defense, Personnel, Snap Counts) + Auto Snaps (experimental)  
+3) Key Notes & Media Summaries  
+4) Injuries  
+5) Opponent Preview & Weekly Game Predictions  
+6) Exports & Downloads  
+"""
+)
+
+# 1) Weekly Controls
+with st.expander("1) Weekly Controls", expanded=True):
+    c1, c2, c3 = st.columns([1,1,2])
+    with c1:
+        st.write(f"**Selected Week:** {week_input}")
+    with c2:
+        st.write(f"**Opponent:** {opponent_input}")
+    with c3:
+        st.caption("Use the sidebar to change Week and Opponent. These values are applied to uploads and forms below.")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        if st.button("Fetch NFL Data (Auto)"):
+            stats = fetch_week_stats(team="CHI", opponent=opponent_input, week_int=week_int, season=CURRENT_SEASON)
+            if stats:
+                off_row = {c: pd.NA for c in OFF_EXPANDED_COLS}
+                off_row.update({"Week": week_input, "Opponent": opponent_input, "Team": "CHI"})
+                for k,v in stats.items():
+                    if k in OFF_EXPANDED_COLS:
+                        off_row[k] = v
+                df_off = pd.DataFrame([off_row])
+
+                def_row = {c: pd.NA for c in DEF_EXPANDED_COLS}
+                def_row.update({"Week": week_input, "Opponent": opponent_input, "Team": "CHI"})
+                for k,v in stats.items():
+                    if k.startswith("DEF__"):
+                        key = k.replace("DEF__", "")
+                        if key in DEF_EXPANDED_COLS:
+                            def_row[key] = v
+                df_def = pd.DataFrame([def_row])
+
+                upsert_sheet(DATA_FILE, "Offense", df_off)
+                upsert_sheet(DATA_FILE, "Defense", df_def)
+                st.success("Fetched NFL weekly data and merged into Excel (Offense/Defense).")
+            else:
+                st.warning("No NFL data merged (library missing or data not yet available).")
+    with cc2:
+        if st.button("Compute NFL Averages"):
+            avg_map = compute_nfl_averages_for_week(week_int=week_int, season=CURRENT_SEASON)
+            if not avg_map:
+                st.info("Could not compute NFL averages (library missing or data unavailable).")
+            else:
+                if openpyxl is not None and os.path.exists(DATA_FILE):
+                    wb = openpyxl.load_workbook(DATA_FILE)
+                    for sheet_name in ["Offense","Defense","Personnel"]:
+                        if sheet_name in wb.sheetnames:
+                            ws = wb[sheet_name]
+                            data = list(ws.values)
+                            if not data:
+                                continue
+                            header = list(data[0])
+                            rows = data[1:]
+                            df = pd.DataFrame(rows, columns=header)
+                            df = fill_nfl_avg_columns(df, avg_map)
+                            ws.delete_rows(1, ws.max_row)
+                            ws.append(df.columns.tolist())
+                            for _, r in df.iterrows():
+                                ws.append(r.tolist())
+                    wb.save(DATA_FILE)
+                    st.success("NFL averages filled where empty.")
+                else:
+                    st.info("Excel not available to update.")
+
+# 2) Upload Weekly Files + Auto Snaps (experimental)
+with st.expander("2) Upload Weekly Files (Offense, Defense, Personnel, Snap Counts) + Auto Snaps", expanded=True):
+    cols = st.columns(4)
+    with cols[0]:
+        off_file = st.file_uploader("Upload Offense CSV", type=["csv"], key="off_up_main")
+    with cols[1]:
+        def_file = st.file_uploader("Upload Defense CSV", type=["csv"], key="def_up_main")
+    with cols[2]:
+        per_file = st.file_uploader("Upload Personnel CSV", type=["csv"], key="per_up_main")
+    with cols[3]:
+        sc_file = st.file_uploader("Upload Snap Counts CSV", type=["csv"], key="sc_up_main")
+
+    if off_file is not None:
+        df_off = pd.read_csv(off_file)
+        df_off = ensure_columns(df_off, OFF_EXPANDED_COLS)
+        df_off = clean_df(df_off, opponent_input, team="CHI")
+        upsert_sheet(DATA_FILE, "Offense", df_off)
+        st.success(f"Offense rows saved: {len(df_off)}")
+
+    if def_file is not None:
+        df_def = pd.read_csv(def_file)
+        df_def = ensure_columns(df_def, DEF_EXPANDED_COLS)
+        df_def = clean_df(df_def, opponent_input, team="CHI")
+        upsert_sheet(DATA_FILE, "Defense", df_def)
+        st.success(f"Defense rows saved: {len(df_def)}")
+
+    if per_file is not None:
+        df_per = pd.read_csv(per_file)
+        df_per = ensure_columns(df_per, PERSONNEL_COLS)
+        df_per = clean_df(df_per, opponent_input, team="CHI")
+        upsert_sheet(DATA_FILE, "Personnel", df_per)
+        st.success(f"Personnel rows saved: {len(df_per)}")
+
+    if sc_file is not None:
+        df_sc = pd.read_csv(sc_file)
+        df_sc = ensure_columns(df_sc, SNAPCOUNTS_COLS)
+        df_sc = clean_df(df_sc, opponent_input, team="CHI")
+        upsert_sheet(DATA_FILE, "Snap_Counts", df_sc)
+        st.success(f"Snap Counts rows saved: {len(df_sc)}")
+
+    st.divider()
+    if st.button("Fetch Snap Counts (experimental)"):
+        st.info("Auto snap counts fetch is not guaranteed by nfl_data_py; please upload CSV if this returns nothing.")
+
+# 3) Key Notes & Media Summaries
+with st.expander("3) Key Notes & Media Summaries", expanded=False):
+    st.subheader("Key Notes")
+    notes = st.text_area("Notes for this week", height=120, key="notes_text")
+    if st.button("Save Notes"):
+        df = pd.DataFrame([{ "Week": week_input, "Opponent": opponent_input, "Notes": notes }])
+        upsert_sheet(DATA_FILE, "Weekly_Notes", df, key_cols=["Week","Opponent"]) 
+        st.success("Notes saved.")
+
+    st.subheader("Media Summaries")
+    source = st.text_input("Source (e.g., ESPN, The Athletic)")
+    summary = st.text_area("Summary", height=150)
+    if st.button("Save Media Summary"):
+        df = pd.DataFrame([{ "Week": week_input, "Opponent": opponent_input, "Source": source, "Summary": summary }])
+        upsert_sheet(DATA_FILE, "Media", df, key_cols=["Week","Opponent","Source"]) 
+        st.success("Media summary saved.")
+
+# 4) Injuries
+with st.expander("4) Injuries", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        inj_player = st.text_input("Player")
+        inj_status = st.selectbox("Status", ["Questionable","Doubtful","Out","Active","IR"], index=0)
+        inj_part = st.text_input("Body Part")
+    with c2:
+        inj_practice = st.selectbox("Practice", ["DNP","Limited","Full","NA"], index=3)
+        inj_game = st.selectbox("Game Status", ["Active","Inactive","TBD"], index=2)
+    with c3:
+        inj_notes = st.text_area("Notes", height=100)
+    if st.button("Save Injury"):
+        df = pd.DataFrame([{ "Week": week_input, "Opponent": opponent_input, "Team": "CHI", "Player": inj_player, "Status": inj_status, "BodyPart": inj_part, "Practice": inj_practice, "GameStatus": inj_game, "Notes": inj_notes }])
+        upsert_sheet(DATA_FILE, "Injuries", df, key_cols=["Week","Opponent","Player"]) 
+        st.success("Injury saved.")
+
+# 5) Opponent Preview & Weekly Game Predictions
+with st.expander("5) Opponent Preview & Predictions", expanded=False):
+    st.subheader("Opponent Preview")
+    k_threats = st.text_area("Key Threats", height=80)
+    tendencies = st.text_area("Tendencies", height=80)
+    opp_inj = st.text_area("Opponent Injuries", height=80)
+    opp_notes = st.text_area("Notes", height=80)
+    if st.button("Save Opponent Preview"):
+        df = pd.DataFrame([{ "Week": week_input, "Opponent": opponent_input, "Key_Threats": k_threats, "Tendencies": tendencies, "Injuries": opp_inj, "Notes": opp_notes }])
+        upsert_sheet(DATA_FILE, "Opponent_Preview", df, key_cols=["Week","Opponent"]) 
+        st.success("Opponent preview saved.")
+
+    st.subheader("Weekly Game Predictions")
+    pred_winner = st.selectbox("Predicted Winner", options=["CHI", opponent_input])
+    pred_conf = st.slider("Confidence (1–100)", min_value=1, max_value=100, value=60)
+    pred_rat = st.text_area("Rationale", height=100)
+    if st.button("Save Prediction"):
+        df = pd.DataFrame([{ "Week": week_input, "Opponent": opponent_input, "Predicted_Winner": pred_winner, "Confidence": pred_conf, "Rationale": pred_rat }])
+        upsert_sheet(DATA_FILE, "Predictions", df, key_cols=["Week","Opponent"]) 
+        st.success("Prediction saved.")
+
+# 6) Exports & Downloads
+with st.expander("6) Exports & Downloads", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Export Week Excel (Pre/Post)"):
+            path = export_week_excel(week_input, opponent_input)
+            if path:
+                st.success(f"Excel exported → {path}")
+                with open(path, "rb") as f:
+                    st.download_button("Download Week Excel", data=f, file_name=os.path.basename(path), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with c2:
+        if st.button("Export Final PDF"):
+            path = export_final_pdf(week_input, opponent_input)
+            if path:
+                st.success(f"Final PDF exported → {path}")
+                with open(path, "rb") as f:
+                    st.download_button("Download Final PDF", data=f, file_name=os.path.basename(path), mime="application/pdf")
+
+
 st.markdown("### Live Data Preview (current Excel)")
 if openpyxl is not None and os.path.exists(DATA_FILE):
     wb = openpyxl.load_workbook(DATA_FILE)
