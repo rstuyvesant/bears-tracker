@@ -236,189 +236,6 @@ def fetch_week_stats(team: str, opponent: str, week_int: int, season: int) -> Di
         st.warning("nfl_data_py not installed; cannot auto-fetch NFL data.")
         return result
 
-    def safe_try(func, *args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            st.info(f"Fallback note: {getattr(func, '__name__', 'call')} failed → {e}")
-            return None
-
-    # 1) Primary: weekly team stats (fast)
-    weekly = safe_try(nfl.import_weekly_data, [season])
-    if weekly is not None and not weekly.empty:
-        df = weekly.copy()
-        # Try common team column names
-        team_col = "team" if "team" in df.columns else ("posteam" if "posteam" in df.columns else None)
-        if team_col is not None and "week" in df.columns:
-            df_team = df[(df[team_col].astype(str).str.upper()==team.upper()) & (df["week"]==week_int)]
-            if not df_team.empty:
-                # Aggregate core offensive metrics
-                pass_yds = float(df_team.get("passing_yards", pd.Series(dtype=float)).sum() or 0)
-                if pass_yds == 0 and "pass_yards" in df_team: pass_yds = float(df_team["pass_yards"].sum())
-                rush_yds = float(df_team.get("rushing_yards", pd.Series(dtype=float)).sum() or 0)
-                if rush_yds == 0 and "rush_yards" in df_team: rush_yds = float(df_team["rush_yards"].sum())
-                pass_td = float(df_team.get("passing_tds", pd.Series(dtype=float)).sum() or 0)
-                rush_td = float(df_team.get("rushing_tds", pd.Series(dtype=float)).sum() or 0)
-                comp = df_team.get("completions", pd.Series(dtype=float)).sum() if "completions" in df_team else None
-                att  = df_team.get("attempts", pd.Series(dtype=float)).sum() if "attempts" in df_team else None
-                ypa  = float(pass_yds/att) if att and att!=0 else pd.NA
-                cmp  = float((comp/att)*100) if comp is not None and att and att!=0 else pd.NA
-                result.update({
-                    "PassYds": pass_yds,
-                    "RushYds": rush_yds,
-                    "PassTD": pass_td,
-                    "RushTD": rush_td,
-                    "YPA": ypa,
-                    "CMP%": cmp,
-                    "RecvYds": pass_yds if pd.isna(pass_yds)==False else pd.NA,
-                    "Total_YDS": (pass_yds + rush_yds)
-                })
-
-    # 2) Fallback: team seasonal summary (per‑game averages) — then take week row if present
-    if not result:
-        team_summ = None
-        # Guard against older nfl_data_py versions where this function may not exist
-        if hasattr(nfl, 'import_seasonal_team_stats'):
-            team_summ = safe_try(nfl.import_seasonal_team_stats, [season])
-        elif hasattr(nfl, 'import_team_desc'):
-            # Not stats, but confirms team exists; keep as no-op placeholder
-            safe_try(nfl.import_team_desc)
-        if team_summ is not None and hasattr(team_summ, 'empty') and not team_summ.empty:
-            df = team_summ.copy()
-            if 'team' in df.columns:
-                df_team = df[df['team'].astype(str).str.upper()==team.upper()]
-                if not df_team.empty:
-                    result.update({
-                        'PassYds': float(df_team.get('pass_yds', pd.Series(dtype=float)).mean() or 0),
-                        'RushYds': float(df_team.get('rush_yds', pd.Series(dtype=float)).mean() or 0),
-                        'PassTD': float(df_team.get('pass_tds', pd.Series(dtype=float)).mean() or 0),
-                        'RushTD': float(df_team.get('rush_tds', pd.Series(dtype=float)).mean() or 0),
-                    })
-
-    # 3) Fallback: schedules/boxscores (if exposed)
-    if not result:
-        sched = safe_try(nfl.import_schedules, [season])
-        if sched is not None and not sched.empty:
-            # Try to locate game id for week
-            df = sched.copy()
-            # Abbreviation columns vary: team, team_home, team_away
-            if all(c in df.columns for c in ["team_home","team_away","week"]):
-                game = df[((df["team_home"].astype(str).str.upper()==team.upper()) | (df["team_away"].astype(str).str.upper()==team.upper())) & (df["week"]==week_int)]
-                if not game.empty:
-                    # If points columns exist, take them
-                    for side in ["home","away"]:
-                        pts_col = f"result_{side}" if f"result_{side}" in game.columns else (f"points_{side}" if f"points_{side}" in game.columns else None)
-                        if pts_col:
-                            try:
-                                result["Points"] = float(pd.to_numeric(game[pts_col], errors='coerce').iloc[0])
-                                break
-                            except Exception:
-                                pass
-
-    # Defensive placeholders (we still add them so columns exist downstream)
-    if "SacksAgainst" not in result:
-        result["SacksAgainst"] = pd.NA
-    for k in [
-        "Sacks","QB_Hits","Pressures","INT","Turnovers","FF","FR",
-        "3rd_Down%_Allowed","RZ%_Allowed","YdsAllowed_Pass","YdsAllowed_Rush","PointsAllowed"
-    ]:
-        result.setdefault(f"DEF__{k}", pd.NA)
-
-    return result
-    try:
-        # nflfastR weekly data (play-by-play derived). Using weekly is more stable than schedules.
-        weekly = nfl.import_weekly_data([season])  # can be large; filtered next
-        # Normalize team abbreviations
-        df = weekly.copy()
-        # Columns differ across versions; try common patterns
-        # Filter for team & week
-        if "team" in df.columns:
-            df_team = df[(df["team"].str.upper()==team.upper()) & (df["week"]==week_int)]
-        elif "posteam" in df.columns:
-            df_team = df[(df["posteam"].str.upper()==team.upper()) & (df["week"]==week_int)]
-        else:
-            df_team = df[df.get("week", pd.Series(dtype=int))==week_int]
-
-        if df_team.empty:
-            st.info("No rows found for team/week in weekly dataset; data may not be published yet.")
-            return result
-
-        # Aggregate common metrics (best-effort)
-        # Try both snake_case and alt names
-        def first_available(row: pd.Series, names: List[str]):
-            for n in names:
-                if n in row and pd.notna(row[n]):
-                    return row[n]
-            return pd.NA
-
-        # Use sums/means where appropriate
-        # Passing yards
-        result["PassYds"] = float(df_team.get("passing_yards", pd.Series(dtype=float)).sum() or 0)
-        if result["PassYds"] == 0 and "pass_yards" in df_team:
-            result["PassYds"] = float(df_team["pass_yards"].sum())
-
-        result["RushYds"] = float(df_team.get("rushing_yards", pd.Series(dtype=float)).sum() or 0)
-        if result["RushYds"] == 0 and "rush_yards" in df_team:
-            result["RushYds"] = float(df_team["rush_yards"].sum())
-
-        result["PassTD"] = float(df_team.get("passing_tds", pd.Series(dtype=float)).sum() or 0)
-        result["RushTD"] = float(df_team.get("rushing_tds", pd.Series(dtype=float)).sum() or 0)
-
-        # Sacks against (offense): sacks taken often stored as sacks, positive is defensive sacks.
-        if "sacks" in df_team:
-            # If positive means sacks by defense, sacks against offense is negative of own sacks? Use abs total for week.
-            result["SacksAgainst"] = float(abs(df_team["sacks"].sum()))
-        else:
-            result["SacksAgainst"] = 0.0
-
-        # Completions/Attempts for YPA & CMP%
-        comp = df_team.get("completions", pd.Series(dtype=float)).sum() if "completions" in df_team else None
-        att = df_team.get("attempts", pd.Series(dtype=float)).sum() if "attempts" in df_team else None
-        if att and att != 0:
-            result["YPA"] = float(result["PassYds"]/att)
-            result["CMP%"] = float((comp/att)*100) if comp is not None else pd.NA
-        else:
-            result["YPA"] = pd.NA
-            result["CMP%"] = pd.NA
-
-        # Basic placeholders if data not present in that dataset
-        result.setdefault("RecvYds", result.get("PassYds", 0))
-        result.setdefault("Points", pd.NA)
-        result.setdefault("Turnovers", pd.NA)
-        result.setdefault("YAC", pd.NA)
-        result.setdefault("Targets", pd.NA)
-        result.setdefault("Recs", comp if comp is not None else pd.NA)
-        result.setdefault("1D", pd.NA)
-        result.setdefault("Total_YDS", (result.get("PassYds",0) + result.get("RushYds",0)))
-        result.setdefault("QBR", pd.NA)
-        result.setdefault("SR%", pd.NA)
-        result.setdefault("EPA", pd.NA)
-        result.setdefault("DVOA", pd.NA)
-        result.setdefault("Red_Zone%", pd.NA)
-        result.setdefault("3rd_Down_Conv%", pd.NA)
-        result.setdefault("Expl_Plays (20+)", pd.NA)
-
-        # Defense — derive limited items if possible (these are tricky from weekly team table)
-        result_def = {
-            "Sacks": pd.NA,
-            "QB_Hits": pd.NA,
-            "Pressures": pd.NA,
-            "INT": pd.NA,
-            "Turnovers": pd.NA,
-            "FF": pd.NA,
-            "FR": pd.NA,
-            "3rd_Down%_Allowed": pd.NA,
-            "RZ%_Allowed": pd.NA,
-            "YdsAllowed_Pass": pd.NA,
-            "YdsAllowed_Rush": pd.NA,
-            "PointsAllowed": pd.NA,
-        }
-        result.update({f"DEF__{k}": v for k,v in result_def.items()})
-
-    except Exception as e:
-        st.warning(f"NFL fetch failed: {e}")
-    return result
-
 
 def compute_nfl_averages_for_week(week_int: int, season: int) -> Dict[str, float]:
     """Compute league averages for a subset of metrics. Returns mapping for NFL_Avg._* columns."""
@@ -619,7 +436,7 @@ def _metric_pairs_for_sheet(sheet_name: str):
     return better_high, better_low
 
 
-def _style_by_nfl_avg(df: pd.DataFrame, sheet_name: str) -> pd.io.formats.style.Styler:
+def _style_by_nfl_avg(df: pd.DataFrame, sheet_name: str):  # returns a Styler
     better_high, better_low = _metric_pairs_for_sheet(sheet_name)
     avg_map = {c.replace("NFL_Avg._", ""): c for c in df.columns if c.startswith("NFL_Avg._")}
 
@@ -887,7 +704,7 @@ if openpyxl is not None and os.path.exists(DATA_FILE):
                 rows = data[1:]
                 df = pd.DataFrame(rows, columns=header)
                 
-                if 'color_toggle' in st.session_state and st.session_state['color_coding'] and sheet_name in ['Offense','Defense','Personnel']:
+                if st.session_state.get('color_coding', True) and sheet_name in ['Offense','Defense','Personnel']:
                     try:
                         st.dataframe(_style_by_nfl_avg(df, sheet_name), width='stretch')
                     except Exception:
