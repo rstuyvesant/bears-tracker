@@ -1,5 +1,5 @@
 ﻿# bears_dashboard.py
-# Chicago Bears 2025–26 Weekly Tracker (stable consolidated build)
+# Chicago Bears 2025–26 Weekly Tracker (stable consolidated build with Season selector & diagnostics)
 # - Six main sections
 # - Sidebar: NFL updates, Snap updates, Color Codes (auto), Downloads
 # - Safe Excel handling + nfl_data_py 0.3.2 compatibility
@@ -61,7 +61,7 @@ ALL_SHEETS = [
 
 # For controls
 NFL_TEAM = "CHI"   # standardized 3-letter team code
-CURRENT_SEASON = 2025
+DEFAULT_SEASON = 2025  # user-selectable in sidebar
 
 
 # ==============================
@@ -165,9 +165,9 @@ def fetch_week_stats(season: int, week: int, team_abbr: str) -> pd.DataFrame:
     Try weekly team stats first; fall back to seasonal aggregates if weekly missing.
     Works on nfl-data-py 0.3.2+.
     """
-    # 1) Try weekly data
+    # 1) Weekly data
     try:
-        weekly = nfl.import_weekly_data([season])  # big, but reliable
+        weekly = nfl.import_weekly_data([season])  # large, but reliable
         weekly = _normalize_team_col(weekly)
         if 'week' in weekly.columns:
             dfw = weekly[(weekly['team'] == team_abbr) & (weekly['week'] == week)].copy()
@@ -212,7 +212,7 @@ def fetch_nfl_averages(season: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     nfl_off_avg = off_by_team.mean(numeric_only=True).to_frame().T
     nfl_off_avg.columns = [f"NFL_Avg._{c}" for c in nfl_off_avg.columns]
 
-    # Defensive perspective (mirror for now; you can customize with allowed metrics)
+    # Defensive perspective (mirror for now; customize if you track _Allowed metrics)
     nfl_def_avg = nfl_off_avg.copy()
 
     return nfl_off_avg.reset_index(drop=True), nfl_def_avg.reset_index(drop=True)
@@ -301,13 +301,13 @@ except Exception:
     FPDF = None
 
 
-def export_week_pdf(week: int, opponent: str, summary_lines: list[str]) -> bytes:
+def export_week_pdf(season: int, week: int, opponent: str, summary_lines: list[str]) -> bytes:
     if FPDF is None:
         return b""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=14)
-    pdf.cell(0, 10, f"Bears Weekly Report — Week {week} vs {opponent}", ln=1)
+    pdf.cell(0, 10, f"Bears Weekly Report — {season} Week {week} vs {opponent}", ln=1)
     pdf.set_font("Arial", size=11)
     for line in summary_lines:
         pdf.multi_cell(0, 8, txt=line)
@@ -321,6 +321,9 @@ def export_week_pdf(week: int, opponent: str, summary_lines: list[str]) -> bytes
 # ==============================
 st.sidebar.title("Controls")
 
+# NEW: Season selector
+season_input = st.sidebar.number_input("Season", min_value=2012, max_value=2030, value=DEFAULT_SEASON, step=1)
+
 # Week & Opponent selection (global)
 week_input = st.sidebar.number_input("Week", min_value=1, max_value=22, value=1, step=1)
 opponent_input = st.sidebar.text_input("Opponent (3-letter code)", value="MIN")
@@ -329,7 +332,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("NFL Updates")
 
 if st.sidebar.button("Fetch NFL Data (Auto)"):
-    off_avg, def_avg = fetch_nfl_averages(CURRENT_SEASON)
+    off_avg, def_avg = fetch_nfl_averages(int(season_input))
     if off_avg.empty:
         st.sidebar.error("Could not compute NFL averages (library missing or data unavailable).")
     else:
@@ -339,7 +342,7 @@ if st.sidebar.button("Fetch NFL Data (Auto)"):
 
 st.sidebar.subheader("Snap Updates")
 if st.sidebar.button("Fetch Snap Counts"):
-    snaps = fetch_snap_counts(CURRENT_SEASON, NFL_TEAM)
+    snaps = fetch_snap_counts(int(season_input), NFL_TEAM)
     if snaps.empty:
         st.sidebar.warning("No snap counts fetched.")
     else:
@@ -352,7 +355,7 @@ if st.sidebar.button("Fetch Snap Counts"):
             snaps = snaps[keep]
         append_to_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS, snaps,
                         dedupe_on=["season", "week", "team", "player"] if "player" in snaps.columns else ["season", "week", "team"])
-        st.sidebar.success(f"Snap counts saved for {NFL_TEAM} {CURRENT_SEASON}.")
+        st.sidebar.success(f"Snap counts saved for {NFL_TEAM} {int(season_input)}.")
 
 st.sidebar.subheader("Color Codes (Auto)")
 st.sidebar.caption("Green = better than NFL average; Red = worse (direction-aware).")
@@ -374,11 +377,11 @@ else:
     st.sidebar.info("Excel not found yet; upload a CSV or fetch to create it.")
 
 # Download current week's PDF (if generated below)
-pdf_stub_path = os.path.join(EXPORTS_DIR, f"W{int(week_input):02d}_{opponent_input}_Final.pdf")
+pdf_stub_path = os.path.join(EXPORTS_DIR, f"{int(season_input)}_W{int(week_input):02d}_{opponent_input}_Final.pdf")
 if os.path.exists(pdf_stub_path):
     with open(pdf_stub_path, "rb") as f:
         st.sidebar.download_button(
-            label=f"Download Final PDF (W{int(week_input):02d})",
+            label=f"Download Final PDF ({int(season_input)} W{int(week_input):02d})",
             data=f.read(),
             file_name=os.path.basename(pdf_stub_path),
             mime="application/pdf"
@@ -405,14 +408,14 @@ This page renders in this order:
 """
 )
 
-# Show selected week/opponent at top
+# Show selected season/week/opponent at top
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
-    st.write(f"**Selected Week:** {int(week_input)}")
+    st.write(f"**Season:** {int(season_input)} | **Week:** {int(week_input)}")
 with c2:
     st.write(f"**Opponent:** {opponent_input}")
 with c3:
-    st.caption("Use the sidebar to change Week and Opponent. These drive uploads and exports.")
+    st.caption("Use the sidebar to change Season, Week, and Opponent. These drive uploads and exports.")
 
 
 # ==============================
@@ -424,11 +427,68 @@ with st.expander("1) Weekly Controls", expanded=True):
     with cc1:
         st.markdown("**Quick Fetch (This Week)**")
         if st.button("Fetch CHI Week Stats (Auto)"):
-            dfw = fetch_week_stats(CURRENT_SEASON, int(week_input), NFL_TEAM)
+            sz_week = pd.DataFrame()
+            sz_season = pd.DataFrame()
+
+            # Try weekly & seasonal raw imports for diagnostics
+            try:
+                raw_weekly = nfl.import_weekly_data([int(season_input)])
+                sz_week = raw_weekly
+            except Exception as e:
+                st.warning(f"Weekly import failed: {e}")
+
+            try:
+                raw_seasonal = nfl.import_seasonal_data([int(season_input)])
+                sz_season = raw_seasonal
+            except Exception as e:
+                st.warning(f"Seasonal import failed: {e}")
+
+            # Diagnostics
+            st.caption(
+                f"Diagnostics — weekly rows: {0 if sz_week is None else len(sz_week)} | "
+                f"seasonal rows: {0 if sz_season is None else len(sz_season)}"
+            )
+            if sz_week is not None and not sz_week.empty and 'season' in sz_week.columns:
+                try:
+                    st.caption(f"Weekly unique seasons: {sorted(set(sz_week['season']))}")
+                except Exception:
+                    pass
+            if sz_season is not None and not sz_season.empty and 'season' in sz_season.columns:
+                try:
+                    st.caption(f"Seasonal unique seasons: {sorted(set(sz_season['season']))}")
+                except Exception:
+                    pass
+
+            # Use normalized wrapper for actual week/team pull
+            dfw = fetch_week_stats(int(season_input), int(week_input), NFL_TEAM)
+
             if dfw.empty:
-                st.warning("No weekly data found; seasonal fallback used or empty result.")
+                st.warning(
+                    "No weekly rows found for this season/week/team and seasonal fallback was empty. "
+                    "This usually means the selected season/week isn't published in nfl-data-py yet. "
+                    "Try switching Season to 2024 to test, or upload CSVs in section 2."
+                )
             else:
-                st.success(f"Fetched data for CHI week {int(week_input)}")
+                # Normalize keys
+                dfw["season"] = dfw.get("season", int(season_input))
+                dfw["week"]   = dfw.get("week", int(week_input))
+                dfw["team"]   = dfw.get("team", NFL_TEAM)
+                dfw = dfw.loc[:, ~dfw.columns.duplicated()]
+
+                # Append to Offense & Defense (mirrored storage)
+                _off = append_to_sheet(
+                    EXCEL_PATH, SHEET_OFFENSE, dfw,
+                    dedupe_on=["season", "week", "team"]
+                )
+                _def = append_to_sheet(
+                    EXCEL_PATH, SHEET_DEFENSE, dfw,
+                    dedupe_on=["season", "week", "team"]
+                )
+
+                st.success(
+                    f"Saved {int(season_input)} Week {int(week_input)}: "
+                    f"Offense rows={len(_off)} • Defense rows={len(_def)}"
+                )
                 st.dataframe(dfw.head(50), width="stretch")
 
     with cc2:
@@ -440,7 +500,7 @@ with st.expander("1) Weekly Controls", expanded=True):
         if st.button("Save Notes to Opponent Preview"):
             if key_notes.strip():
                 row = pd.DataFrame([{
-                    "season": CURRENT_SEASON,
+                    "season": int(season_input),
                     "week": int(week_input),
                     "team": NFL_TEAM,
                     "opponent": opponent_input.strip().upper(),
@@ -468,7 +528,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
         if f_off is not None:
             try:
                 df = pd.read_csv(f_off)
-                df["season"] = df.get("season", CURRENT_SEASON)
+                df["season"] = df.get("season", int(season_input))
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
                 df = df.loc[:, ~df.columns.duplicated()]
@@ -483,7 +543,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
         if f_def is not None:
             try:
                 df = pd.read_csv(f_def)
-                df["season"] = df.get("season", CURRENT_SEASON)
+                df["season"] = df.get("season", int(season_input))
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
                 df = df.loc[:, ~df.columns.duplicated()]
@@ -499,7 +559,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
         if f_per is not None:
             try:
                 df = pd.read_csv(f_per)
-                df["season"] = df.get("season", CURRENT_SEASON)
+                df["season"] = df.get("season", int(season_input))
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
                 df = df.loc[:, ~df.columns.duplicated()]
@@ -514,7 +574,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
         if f_snap is not None:
             try:
                 df = pd.read_csv(f_snap)
-                df["season"] = df.get("season", CURRENT_SEASON)
+                df["season"] = df.get("season", int(season_input))
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
                 df = df.loc[:, ~df.columns.duplicated()]
@@ -569,7 +629,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
 with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
     st.caption("Merges weekly data with NFL_Avg columns (from auto or manual) and shows green/red cells. Extend metric lists in code.")
 
-    # Compose a simple merged preview for Offense and Defense (current week)
+    # Compose a simple merged preview for Offense and Defense (current season/week)
     off_df = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
     def_df = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
 
@@ -586,8 +646,8 @@ with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
     # OFFENSE
     st.markdown("**Offense — Week Merge vs NFL Avg**")
     if not off_df.empty:
-        cur_off = off_df[(off_df.get("season", CURRENT_SEASON) == CURRENT_SEASON) &
-                         (off_df.get("week", week_input) == int(week_input))].copy()
+        cur_off = off_df[(off_df.get("season", int(season_input)) == int(season_input)) &
+                         (off_df.get("week", int(week_input)) == int(week_input))].copy()
         if not cur_off.empty and not nfl_avg_row.empty:
             ids = [c for c in cur_off.columns if c in ("season", "week", "team", "opponent")]
             nums = [c for c in cur_off.columns if c not in ids and pd.api.types.is_numeric_dtype(cur_off[c])]
@@ -601,8 +661,8 @@ with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
     # DEFENSE
     st.markdown("**Defense — Week Merge vs NFL Avg**")
     if not def_df.empty:
-        cur_def = def_df[(def_df.get("season", CURRENT_SEASON) == CURRENT_SEASON) &
-                         (def_df.get("week", week_input) == int(week_input))].copy()
+        cur_def = def_df[(def_df.get("season", int(season_input)) == int(season_input)) &
+                         (def_df.get("week", int(week_input)) == int(week_input))].copy()
         if not cur_def.empty and not nfl_avg_row.empty:
             ids = [c for c in cur_def.columns if c in ("season", "week", "team", "opponent")]
             nums = [c for c in cur_def.columns if c not in ids and pd.api.types.is_numeric_dtype(cur_def[c])]
@@ -647,7 +707,7 @@ with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
 
     if st.button("Save Weekly Prediction"):
         row = pd.DataFrame([{
-            "season": CURRENT_SEASON,
+            "season": int(season_input),
             "week": int(week_input),
             "team": NFL_TEAM,
             "opponent": opponent_input.strip().upper(),
@@ -673,24 +733,24 @@ with st.expander("6) Exports & Downloads", expanded=True):
         def_this = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
 
         lines = [
-            f"Week {int(week_input)} vs {opponent_input}",
+            f"Season {int(season_input)} — Week {int(week_input)} vs {opponent_input}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             ""
         ]
         if not off_this.empty:
-            offw = off_this[(off_this.get("season", CURRENT_SEASON) == CURRENT_SEASON) &
-                            (off_this.get("week", week_input) == int(week_input))]
+            offw = off_this[(off_this.get("season", int(season_input)) == int(season_input)) &
+                            (off_this.get("week", int(week_input)) == int(week_input))]
             lines.append(f"Offense rows: {len(offw)}")
         if not def_this.empty:
-            defw = def_this[(def_this.get("season", CURRENT_SEASON) == CURRENT_SEASON) &
-                            (def_this.get("week", week_input) == int(week_input))]
+            defw = def_this[(def_this.get("season", int(season_input)) == int(season_input)) &
+                            (def_this.get("week", int(week_input)) == int(week_input))]
             lines.append(f"Defense rows: {len(defw)}")
 
-        pdf_bytes = export_week_pdf(int(week_input), opponent_input, lines)
+        pdf_bytes = export_week_pdf(int(season_input), int(week_input), opponent_input, lines)
         if not pdf_bytes:
             st.error("FPDF not available — ensure fpdf is in requirements.")
         else:
-            out_path = os.path.join(EXPORTS_DIR, f"W{int(week_input):02d}_{opponent_input}_Final.pdf")
+            out_path = os.path.join(EXPORTS_DIR, f"{int(season_input)}_W{int(week_input):02d}_{opponent_input}_Final.pdf")
             with open(out_path, "wb") as f:
                 f.write(pdf_bytes)
             st.success(f"Final PDF created: {os.path.basename(out_path)}")
@@ -747,3 +807,4 @@ with st.expander("6) Exports & Downloads", expanded=True):
 
     except Exception as e:
         st.error(f"Peek failed: {e}")
+
