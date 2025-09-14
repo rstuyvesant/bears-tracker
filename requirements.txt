@@ -1,8 +1,9 @@
 streamlit==1.49.1
-pandas==2.2.2
-numpy==2.0.1
+pandas==2.3.2
+numpy==2.3.2
 openpyxl==3.1.5
 fpdf==1.7.2
-nfl_data_py==0.3.4
-pyarrow==17.0.0
-requests==2.32.3
+nfl-data-py==0.3.2
+pyarrow==21.0.0
+fastparquet==2024.11.0
+
