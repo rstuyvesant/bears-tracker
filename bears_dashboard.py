@@ -1,7 +1,7 @@
 ﻿# bears_dashboard.py
-# Streamlit Bears Tracker (clean, fixed, and consolidated)
+# Chicago Bears 2025–26 Weekly Tracker (stable consolidated build)
 # - Six main sections
-# - Sidebar: NFL updates, Snap updates, Color Code legend, Downloads (Excel/PDF)
+# - Sidebar: NFL updates, Snap updates, Color Codes (auto), Downloads
 # - Safe Excel handling + nfl_data_py 0.3.2 compatibility
 # - Uses st.dataframe(..., width="stretch")
 
@@ -13,7 +13,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# --- IMPORTANT: fixes the Styler annotation crash on Streamlit Cloud ---
+# --- Fix Styler annotation crash on Streamlit Cloud ---
 from pandas.io.formats.style import Styler
 
 # Excel safety + load
@@ -63,14 +63,14 @@ ALL_SHEETS = [
 NFL_TEAM = "CHI"   # standardized 3-letter team code
 CURRENT_SEASON = 2025
 
+
 # ==============================
 # Utilities: Files / Excel
 # ==============================
-
 def ensure_xlsx(path: str) -> str:
     """
     Ensure an .xlsx exists at `path` and is a valid zip/xlsx.
-    If the file is missing, has the wrong suffix, or is corrupt, recreate it.
+    If missing, wrong suffix, or corrupt, recreate it with expected sheets.
     Returns the (possibly corrected) .xlsx path.
     """
     # Normalize to .xlsx if someone passed a CSV by mistake
@@ -81,7 +81,6 @@ def ensure_xlsx(path: str) -> str:
     # Create if missing
     if not os.path.exists(path):
         wb = Workbook()
-        # Create all sheets we care about up-front so app logic can always find them
         ws = wb.active
         ws.title = SHEET_OFFENSE
         for name in ALL_SHEETS:
@@ -118,7 +117,6 @@ def read_sheet(path: str, sheet: str) -> pd.DataFrame:
     ensure_xlsx(path)
     try:
         df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
-        # Normalize columns
         df.columns = [str(c).strip() for c in df.columns]
         return df
     except Exception:
@@ -127,7 +125,6 @@ def read_sheet(path: str, sheet: str) -> pd.DataFrame:
 
 def write_sheet(path: str, sheet: str, df: pd.DataFrame):
     ensure_xlsx(path)
-    # Keep simple: write the one sheet, preserve others by reading then writing back
     try:
         with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as xlw:
             df.to_excel(xlw, index=False, sheet_name=sheet)
@@ -152,7 +149,6 @@ def append_to_sheet(path: str, sheet: str, df_new: pd.DataFrame, dedupe_on: list
 # ==============================
 # NFL Data Helpers (0.3.2+)
 # ==============================
-
 def _normalize_team_col(df: pd.DataFrame) -> pd.DataFrame:
     """Unify team column naming across nfl_data_py frames."""
     if 'team' in df.columns:
@@ -171,7 +167,7 @@ def fetch_week_stats(season: int, week: int, team_abbr: str) -> pd.DataFrame:
     """
     # 1) Try weekly data
     try:
-        weekly = nfl.import_weekly_data([season])  # large
+        weekly = nfl.import_weekly_data([season])  # big, but reliable
         weekly = _normalize_team_col(weekly)
         if 'week' in weekly.columns:
             dfw = weekly[(weekly['team'] == team_abbr) & (weekly['week'] == week)].copy()
@@ -206,9 +202,8 @@ def fetch_nfl_averages(season: int) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     weekly = _normalize_team_col(weekly)
 
-    # Minimal metric set — expand as needed
-    # Example metrics (you can add CMP%, YPA, RZ%, SACKS if present in your weekly schema)
-    metric_candidates = [c for c in weekly.columns if weekly[c].dtype.kind in "if"]
+    # Minimal numeric set — expand as needed
+    metric_candidates = [c for c in weekly.columns if pd.api.types.is_numeric_dtype(weekly[c])]
     if not metric_candidates:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -217,8 +212,7 @@ def fetch_nfl_averages(season: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     nfl_off_avg = off_by_team.mean(numeric_only=True).to_frame().T
     nfl_off_avg.columns = [f"NFL_Avg._{c}" for c in nfl_off_avg.columns]
 
-    # Defensive perspective: if you track allowed metrics, you can compute similarly
-    # For now, just mirror the same (users often compare defense to NFL averages of those same columns)
+    # Defensive perspective (mirror for now; you can customize with allowed metrics)
     nfl_def_avg = nfl_off_avg.copy()
 
     return nfl_off_avg.reset_index(drop=True), nfl_def_avg.reset_index(drop=True)
@@ -236,12 +230,10 @@ def fetch_snap_counts(season: int, team: str) -> pd.DataFrame:
 # ==============================
 # Styling (Color Codes vs NFL Avg)
 # ==============================
-
 def _metric_pairs_for_sheet(sheet_name: str) -> tuple[list[str], list[str]]:
     """
     Define which metrics are 'better when higher' or 'better when lower'
-    based on the sheet context (Offense vs Defense etc.).
-    Extend as needed.
+    based on the sheet context (Offense vs Defense etc.). Extend as needed.
     """
     # Defaults
     better_high = ["YPA", "YPC", "CMP%", "QBR", "Points", "Yards", "Success_Rate", "YAC"]
@@ -275,26 +267,23 @@ def _style_by_nfl_avg(df: pd.DataFrame, sheet_name: str) -> Styler:
             return ""
 
         try:
-            nfl_avg = df[avg_col].iloc[0]  # NFL average row replicated? If not, adapt.
+            nfl_avg = df[avg_col].iloc[0]
         except Exception:
             return ""
 
         if pd.isna(val) or pd.isna(nfl_avg):
             return ""
 
-        # Decide direction
         if base_name in better_high:
             return "background-color: #e5ffe5" if val > nfl_avg else "background-color: #ffe5e5"
         if base_name in better_low:
             return "background-color: #e5ffe5" if val < nfl_avg else "background-color: #ffe5e5"
-
-        # For metrics we don't know, do nothing
         return ""
 
     def _apply(row):
         styles = []
         for col in df.columns:
-            if col in numeric_cols and col in avg_map or col in better_high or col in better_low:
+            if col in numeric_cols and (col in avg_map or col in better_high or col in better_low):
                 styles.append(_colorize(row[col], col))
             else:
                 styles.append("")
@@ -322,7 +311,6 @@ def export_week_pdf(week: int, opponent: str, summary_lines: list[str]) -> bytes
     pdf.set_font("Arial", size=11)
     for line in summary_lines:
         pdf.multi_cell(0, 8, txt=line)
-    # Write to bytes
     out = io.BytesIO()
     pdf.output(out, "F")
     return out.getvalue()
@@ -345,10 +333,9 @@ if st.sidebar.button("Fetch NFL Data (Auto)"):
     if off_avg.empty:
         st.sidebar.error("Could not compute NFL averages (library missing or data unavailable).")
     else:
-        # Save to corresponding sheets
         write_sheet(EXCEL_PATH, SHEET_YTD_NFL_OFF, off_avg)
         write_sheet(EXCEL_PATH, SHEET_YTD_NFL_DEF, def_avg)
-        st.sidebar.success("NFL averages computed and saved to YTD_NFL_Offense / YTD_NFL_Defense.")
+        st.sidebar.success("NFL averages saved to YTD_NFL_Offense / YTD_NFL_Defense.")
 
 st.sidebar.subheader("Snap Updates")
 if st.sidebar.button("Fetch Snap Counts"):
@@ -356,15 +343,19 @@ if st.sidebar.button("Fetch Snap Counts"):
     if snaps.empty:
         st.sidebar.warning("No snap counts fetched.")
     else:
-        # Keep useful columns if available
-        keep = [c for c in snaps.columns if c in ("season", "week", "team", "player", "position", "offense_snaps", "defense_snaps", "special_teams_snaps", "offense_pct", "defense_pct", "special_teams_pct")]
+        keep = [c for c in snaps.columns if c in (
+            "season", "week", "team", "player", "position",
+            "offense_snaps", "defense_snaps", "special_teams_snaps",
+            "offense_pct", "defense_pct", "special_teams_pct"
+        )]
         if keep:
             snaps = snaps[keep]
-        append_to_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS, snaps, dedupe_on=["season", "week", "team", "player"])
+        append_to_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS, snaps,
+                        dedupe_on=["season", "week", "team", "player"] if "player" in snaps.columns else ["season", "week", "team"])
         st.sidebar.success(f"Snap counts saved for {NFL_TEAM} {CURRENT_SEASON}.")
 
 st.sidebar.subheader("Color Codes (Auto)")
-st.sidebar.caption("Green = better than NFL average; Red = worse (by metric orientation).")
+st.sidebar.caption("Green = better than NFL average; Red = worse (direction-aware).")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Downloads")
@@ -383,17 +374,18 @@ else:
     st.sidebar.info("Excel not found yet; upload a CSV or fetch to create it.")
 
 # Download current week's PDF (if generated below)
-pdf_stub_path = os.path.join(EXPORTS_DIR, f"W{week_input:02d}_{opponent_input}_Final.pdf")
+pdf_stub_path = os.path.join(EXPORTS_DIR, f"W{int(week_input):02d}_{opponent_input}_Final.pdf")
 if os.path.exists(pdf_stub_path):
     with open(pdf_stub_path, "rb") as f:
         st.sidebar.download_button(
-            label=f"Download Final PDF (W{week_input:02d})",
+            label=f"Download Final PDF (W{int(week_input):02d})",
             data=f.read(),
             file_name=os.path.basename(pdf_stub_path),
             mime="application/pdf"
         )
 else:
     st.sidebar.caption("Final PDF will appear here after you export it.")
+
 
 # ==============================
 # Main Header
@@ -416,11 +408,11 @@ This page renders in this order:
 # Show selected week/opponent at top
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
-    st.write(f"**Selected Week:** {week_input}")
+    st.write(f"**Selected Week:** {int(week_input)}")
 with c2:
     st.write(f"**Opponent:** {opponent_input}")
 with c3:
-    st.caption("Use the sidebar to change Week and Opponent. These selections drive uploads and exports.")
+    st.caption("Use the sidebar to change Week and Opponent. These drive uploads and exports.")
 
 
 # ==============================
@@ -441,7 +433,10 @@ with st.expander("1) Weekly Controls", expanded=True):
 
     with cc2:
         st.markdown("**Notes / Key Items**")
-        key_notes = st.text_area("Key Notes (autosaved into OpponentPreview sheet under 'Notes')", value="", height=120)
+        key_notes = st.text_area(
+            "Key Notes (autosaved into OpponentPreview sheet under 'Notes')",
+            value="", height=120
+        )
         if st.button("Save Notes to Opponent Preview"):
             if key_notes.strip():
                 row = pd.DataFrame([{
@@ -452,7 +447,8 @@ with st.expander("1) Weekly Controls", expanded=True):
                     "Notes": key_notes.strip(),
                     "saved_at": datetime.now().isoformat(timespec="seconds")
                 }])
-                append_to_sheet(EXCEL_PATH, SHEET_OPP_PREVIEW, row, dedupe_on=["season", "week", "team", "opponent"])
+                append_to_sheet(EXCEL_PATH, SHEET_OPP_PREVIEW, row,
+                                dedupe_on=["season", "week", "team", "opponent"])
                 st.success("Notes saved.")
             else:
                 st.info("Nothing to save.")
@@ -462,7 +458,7 @@ with st.expander("1) Weekly Controls", expanded=True):
 # 2) Upload Weekly Data
 # ==============================
 with st.expander("2) Upload Weekly Data", expanded=True):
-    st.caption("Upload CSVs for Offense, Defense, Personnel, and Snap Counts (if you prefer manual uploads). Files are appended and deduplicated by common keys when possible.")
+    st.caption("Upload CSVs for Offense, Defense, Personnel, and Snap Counts (manual). Files are appended and deduplicated when possible.")
 
     upc1, upc2 = st.columns(2)
 
@@ -475,9 +471,9 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df["season"] = df.get("season", CURRENT_SEASON)
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
-                df = df.copy()
                 df = df.loc[:, ~df.columns.duplicated()]
-                df_out = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, df, dedupe_on=["season", "week", "team"])
+                df_out = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, df,
+                                         dedupe_on=["season", "week", "team"])
                 st.success(f"Offense rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
@@ -490,9 +486,9 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df["season"] = df.get("season", CURRENT_SEASON)
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
-                df = df.copy()
                 df = df.loc[:, ~df.columns.duplicated()]
-                df_out = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, df, dedupe_on=["season", "week", "team"])
+                df_out = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, df,
+                                         dedupe_on=["season", "week", "team"])
                 st.success(f"Defense rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
@@ -506,9 +502,9 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df["season"] = df.get("season", CURRENT_SEASON)
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
-                df = df.copy()
                 df = df.loc[:, ~df.columns.duplicated()]
-                df_out = append_to_sheet(EXCEL_PATH, SHEET_PERSONNEL, df, dedupe_on=["season", "week", "team"])
+                df_out = append_to_sheet(EXCEL_PATH, SHEET_PERSONNEL, df,
+                                         dedupe_on=["season", "week", "team"])
                 st.success(f"Personnel rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
@@ -521,9 +517,12 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df["season"] = df.get("season", CURRENT_SEASON)
                 df["week"] = df.get("week", int(week_input))
                 df["team"] = df.get("team", NFL_TEAM)
-                df = df.copy()
                 df = df.loc[:, ~df.columns.duplicated()]
-                df_out = append_to_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS, df, dedupe_on=["season", "week", "team", "player"] if "player" in df.columns else ["season", "week", "team"])
+                dedupe_cols = ["season", "week", "team"]
+                if "player" in df.columns:
+                    dedupe_cols.append("player")
+                df_out = append_to_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS, df,
+                                         dedupe_on=dedupe_cols)
                 st.success(f"SnapCounts rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
@@ -534,6 +533,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
 # ==============================
 with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
     st.markdown("**Auto:** Use the sidebar ‘Fetch NFL Data (Auto)’ to compute/sync YTD NFL offense/defense averages.")
+
     off_view = read_sheet(EXCEL_PATH, SHEET_YTD_NFL_OFF)
     if not off_view.empty:
         st.write("**YTD NFL Offense Averages (Auto)**")
@@ -567,13 +567,13 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
 # 4) DVOA Proxy & Color Codes
 # ==============================
 with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
-    st.caption("This view merges your weekly data with NFL_Avg columns (from auto or manual) and shows green/red cells. You can extend the metric lists in the code.")
+    st.caption("Merges weekly data with NFL_Avg columns (from auto or manual) and shows green/red cells. Extend metric lists in code.")
 
     # Compose a simple merged preview for Offense and Defense (current week)
     off_df = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
     def_df = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
 
-    # Build an NFL_Avg row to join (manual preferred, else use auto offense as a source of NFL_Avg._ columns)
+    # Build an NFL_Avg row to join (manual preferred, else auto offense)
     nfl_manual = read_sheet(EXCEL_PATH, SHEET_NFL_AVG_MANUAL)
     nfl_auto_off = read_sheet(EXCEL_PATH, SHEET_YTD_NFL_OFF)
 
@@ -589,7 +589,6 @@ with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
         cur_off = off_df[(off_df.get("season", CURRENT_SEASON) == CURRENT_SEASON) &
                          (off_df.get("week", week_input) == int(week_input))].copy()
         if not cur_off.empty and not nfl_avg_row.empty:
-            # Only keep numeric & a few ID columns
             ids = [c for c in cur_off.columns if c in ("season", "week", "team", "opponent")]
             nums = [c for c in cur_off.columns if c not in ids and pd.api.types.is_numeric_dtype(cur_off[c])]
             preview = pd.concat([cur_off[ids + nums].reset_index(drop=True), nfl_avg_row.reset_index(drop=True)], axis=1)
@@ -624,13 +623,16 @@ with st.expander("4) DVOA Proxy & Color Codes", expanded=True):
 # 5) Opponent Preview & Strategy Notes
 # ==============================
 with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
-    st.caption("Lightweight area for opponent notes, previews, and predictions you can extend later.")
+    st.caption("Area for opponent notes, previews, and predictions you can extend later.")
 
     # Opponent Preview table
     opp = read_sheet(EXCEL_PATH, SHEET_OPP_PREVIEW)
     if not opp.empty:
         st.write("**Opponent Preview (Recent Entries)**")
-        st.dataframe(opp.sort_values("saved_at" if "saved_at" in opp.columns else opp.columns[0]).tail(25), width="stretch")
+        st.dataframe(
+            opp.sort_values("saved_at" if "saved_at" in opp.columns else opp.columns[0]).tail(25),
+            width="stretch"
+        )
     else:
         st.info("No opponent preview entries yet.")
 
@@ -654,7 +656,8 @@ with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
             "Rationale": rationale.strip(),
             "saved_at": datetime.now().isoformat(timespec="seconds")
         }])
-        df_out = append_to_sheet(EXCEL_PATH, SHEET_PREDICTIONS, row, dedupe_on=["season", "week", "team", "opponent"])
+        df_out = append_to_sheet(EXCEL_PATH, SHEET_PREDICTIONS, row,
+                                 dedupe_on=["season", "week", "team", "opponent"])
         st.success("Prediction saved.")
         st.dataframe(df_out.tail(10), width="stretch")
 
@@ -666,7 +669,6 @@ with st.expander("6) Exports & Downloads", expanded=True):
     st.caption("Create a quick PDF and download Excel/PDF here or from the sidebar.")
 
     if st.button("Export Final PDF (This Week)"):
-        # Simple PDF: pull a couple summary lines from sheets to include
         off_this = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
         def_this = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
 
@@ -701,6 +703,8 @@ with st.expander("6) Exports & Downloads", expanded=True):
             )
 
     st.markdown("---")
+
+    # Download Excel
     if os.path.exists(EXCEL_PATH):
         with open(EXCEL_PATH, "rb") as f:
             st.download_button(
@@ -712,46 +716,34 @@ with st.expander("6) Exports & Downloads", expanded=True):
     else:
         st.info("Excel not found yet; upload a CSV or fetch to create it.")
 
-    # Also show a quick peek of the workbook sheets
+    # --- Workbook Peek (safe rendering with proper try/except) ---
     st.markdown("**Workbook Peek**")
     peek_cols = st.columns(3)
+
     try:
-        # --- Workbook Peek (safe rendering) ---
-st.markdown("**Workbook Peek**")
-peek_cols = st.columns(3)
+        with peek_cols[0]:
+            st.write("Offense")
+            off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
+            if not off.empty:
+                st.dataframe(off.tail(10), width="stretch")
+            else:
+                st.caption("—")
 
-# --- Workbook Peek (safe rendering) ---
-st.markdown("**Workbook Peek**")
-peek_cols = st.columns(3)
+        with peek_cols[1]:
+            st.write("Defense")
+            deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
+            if not deff.empty:
+                st.dataframe(deff.tail(10), width="stretch")
+            else:
+                st.caption("—")
 
-try:
-    with peek_cols[0]:
-        st.write("Offense")
-        off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
-        if not off.empty:
-            st.dataframe(off.tail(10), width="stretch")
-        else:
-            st.caption("—")
-
-    with peek_cols[1]:
-        st.write("Defense")
-        deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
-        if not deff.empty:
-            st.dataframe(deff.tail(10), width="stretch")
-        else:
-            st.caption("—")
-
-    with peek_cols[2]:
-        st.write("SnapCounts")
-        snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
-        if not snaps.empty:
-            st.dataframe(snaps.tail(10), width="stretch")
-        else:
-            st.caption("—")
-
-except Exception as e:
-    st.error(f"Peek failed: {e}")
-
+        with peek_cols[2]:
+            st.write("SnapCounts")
+            snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
+            if not snaps.empty:
+                st.dataframe(snaps.tail(10), width="stretch")
+            else:
+                st.caption("—")
 
     except Exception as e:
         st.error(f"Peek failed: {e}")
