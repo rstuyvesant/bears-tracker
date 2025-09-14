@@ -720,29 +720,38 @@ with st.expander("6) Exports & Downloads", expanded=True):
 st.markdown("**Workbook Peek**")
 peek_cols = st.columns(3)
 
-with peek_cols[0]:
-    st.write("Offense")
-    off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
-    if not off.empty:
-        st.dataframe(off.tail(10), width="stretch")
-    else:
-        st.caption("—")
+# --- Workbook Peek (safe rendering) ---
+st.markdown("**Workbook Peek**")
+peek_cols = st.columns(3)
 
-with peek_cols[1]:
-    st.write("Defense")
-    deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
-    if not deff.empty:
-        st.dataframe(deff.tail(10), width="stretch")
-    else:
-        st.caption("—")
+try:
+    with peek_cols[0]:
+        st.write("Offense")
+        off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
+        if not off.empty:
+            st.dataframe(off.tail(10), width="stretch")
+        else:
+            st.caption("—")
 
-with peek_cols[2]:
-    st.write("SnapCounts")
-    snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
-    if not snaps.empty:
-        st.dataframe(snaps.tail(10), width="stretch")
-    else:
-        st.caption("—")
+    with peek_cols[1]:
+        st.write("Defense")
+        deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
+        if not deff.empty:
+            st.dataframe(deff.tail(10), width="stretch")
+        else:
+            st.caption("—")
+
+    with peek_cols[2]:
+        st.write("SnapCounts")
+        snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
+        if not snaps.empty:
+            st.dataframe(snaps.tail(10), width="stretch")
+        else:
+            st.caption("—")
+
+except Exception as e:
+    st.error(f"Peek failed: {e}")
+
 
     except Exception as e:
         st.error(f"Peek failed: {e}")
