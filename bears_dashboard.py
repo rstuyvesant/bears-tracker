@@ -1,5 +1,5 @@
 ﻿# bears_dashboard.py
-# Chicago Bears 2025–26 Weekly Tracker (stable consolidated build with Season selector & diagnostics)
+# Chicago Bears 2025–26 Weekly Tracker (stable build with Season selector, diagnostics, and 404-safe imports)
 # - Six main sections
 # - Sidebar: NFL updates, Snap updates, Color Codes (auto), Downloads
 # - Safe Excel handling + nfl_data_py 0.3.2 compatibility
@@ -23,6 +23,9 @@ from zipfile import BadZipFile
 
 # NFL data (0.3.2+ API)
 import nfl_data_py as nfl
+
+# Network error handling for remote CSVs (404 etc.)
+from urllib.error import HTTPError, URLError
 
 
 # ==============================
@@ -61,7 +64,29 @@ ALL_SHEETS = [
 
 # For controls
 NFL_TEAM = "CHI"   # standardized 3-letter team code
-DEFAULT_SEASON = 2025  # user-selectable in sidebar
+DEFAULT_SEASON = 2024  # user-selectable in sidebar (initial value)
+
+
+# ==============================
+# Safe importer helper (404/network resilient)
+# ==============================
+def import_df_safely(import_fn, seasons: list[int]) -> pd.DataFrame:
+    """
+    Call an nfl_data_py import function and turn network/file errors into empty frames with friendly messages.
+    """
+    try:
+        return import_fn(seasons)
+    except HTTPError as e:
+        code = getattr(e, "code", "HTTPError")
+        msg = f"{import_fn.__name__} for {seasons} returned HTTP {code}."
+        if code == 404:
+            msg += " The season may not be published yet."
+        st.warning(msg)
+    except URLError as e:
+        st.warning(f"{import_fn.__name__} network error: {getattr(e, 'reason', e)}")
+    except Exception as e:
+        st.warning(f"{import_fn.__name__} failed: {e}")
+    return pd.DataFrame()
 
 
 # ==============================
@@ -167,9 +192,9 @@ def fetch_week_stats(season: int, week: int, team_abbr: str) -> pd.DataFrame:
     """
     # 1) Weekly data
     try:
-        weekly = nfl.import_weekly_data([season])  # large, but reliable
+        weekly = import_df_safely(nfl.import_weekly_data, [season])
         weekly = _normalize_team_col(weekly)
-        if 'week' in weekly.columns:
+        if 'week' in weekly.columns and not weekly.empty:
             dfw = weekly[(weekly['team'] == team_abbr) & (weekly['week'] == week)].copy()
             if not dfw.empty:
                 return dfw
@@ -178,12 +203,13 @@ def fetch_week_stats(season: int, week: int, team_abbr: str) -> pd.DataFrame:
 
     # 2) Fallback: seasonal aggregates
     try:
-        seasonal = nfl.import_seasonal_data([season])
+        seasonal = import_df_safely(nfl.import_seasonal_data, [season])
         seasonal = _normalize_team_col(seasonal)
-        dfs = seasonal[seasonal['team'] == team_abbr].copy()
-        if not dfs.empty:
-            dfs['week'] = week  # keep downstream compatibility
-            return dfs
+        if not seasonal.empty:
+            dfs = seasonal[seasonal['team'] == team_abbr].copy()
+            if not dfs.empty:
+                dfs['week'] = week  # keep downstream compatibility
+                return dfs
     except Exception:
         pass
 
@@ -195,9 +221,8 @@ def fetch_nfl_averages(season: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     Compute simple per-team per-season aggregates, then NFL (league) averages for offense & defense views.
     Returns (nfl_off_avg, nfl_def_avg) as single-row DataFrames with columns prefixed 'NFL_Avg._'.
     """
-    try:
-        weekly = nfl.import_weekly_data([season])
-    except Exception:
+    weekly = import_df_safely(nfl.import_weekly_data, [season])
+    if weekly is None or weekly.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     weekly = _normalize_team_col(weekly)
@@ -212,16 +237,15 @@ def fetch_nfl_averages(season: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     nfl_off_avg = off_by_team.mean(numeric_only=True).to_frame().T
     nfl_off_avg.columns = [f"NFL_Avg._{c}" for c in nfl_off_avg.columns]
 
-    # Defensive perspective (mirror for now; customize if you track _Allowed metrics)
+    # Defensive perspective (mirror for now; customize later if you track *_Allowed metrics)
     nfl_def_avg = nfl_off_avg.copy()
 
     return nfl_off_avg.reset_index(drop=True), nfl_def_avg.reset_index(drop=True)
 
 
 def fetch_snap_counts(season: int, team: str) -> pd.DataFrame:
-    try:
-        snaps = nfl.import_snap_counts([season])
-    except Exception:
+    snaps = import_df_safely(nfl.import_snap_counts, [season])
+    if snaps.empty:
         return pd.DataFrame()
     snaps = _normalize_team_col(snaps)
     return snaps[snaps["team"] == team].copy()
@@ -321,7 +345,7 @@ def export_week_pdf(season: int, week: int, opponent: str, summary_lines: list[s
 # ==============================
 st.sidebar.title("Controls")
 
-# NEW: Season selector
+# Season selector (uses DEFAULT_SEASON)
 season_input = st.sidebar.number_input("Season", min_value=2012, max_value=2030, value=DEFAULT_SEASON, step=1)
 
 # Week & Opponent selection (global)
@@ -334,7 +358,7 @@ st.sidebar.subheader("NFL Updates")
 if st.sidebar.button("Fetch NFL Data (Auto)"):
     off_avg, def_avg = fetch_nfl_averages(int(season_input))
     if off_avg.empty:
-        st.sidebar.error("Could not compute NFL averages (library missing or data unavailable).")
+        st.sidebar.error("Could not compute NFL averages (source unavailable or season not published yet).")
     else:
         write_sheet(EXCEL_PATH, SHEET_YTD_NFL_OFF, off_avg)
         write_sheet(EXCEL_PATH, SHEET_YTD_NFL_DEF, def_avg)
@@ -344,7 +368,7 @@ st.sidebar.subheader("Snap Updates")
 if st.sidebar.button("Fetch Snap Counts"):
     snaps = fetch_snap_counts(int(season_input), NFL_TEAM)
     if snaps.empty:
-        st.sidebar.warning("No snap counts fetched.")
+        st.sidebar.warning("No snap counts fetched (source unavailable or season not published yet).")
     else:
         keep = [c for c in snaps.columns if c in (
             "season", "week", "team", "player", "position",
@@ -427,67 +451,45 @@ with st.expander("1) Weekly Controls", expanded=True):
     with cc1:
         st.markdown("**Quick Fetch (This Week)**")
         if st.button("Fetch CHI Week Stats (Auto)"):
-            sz_week = pd.DataFrame()
-            sz_season = pd.DataFrame()
+            season_val = int(season_input)
+            week_val = int(week_input)
 
-            # Try weekly & seasonal raw imports for diagnostics
-            try:
-                raw_weekly = nfl.import_weekly_data([int(season_input)])
-                sz_week = raw_weekly
-            except Exception as e:
-                st.warning(f"Weekly import failed: {e}")
+            # Safer raw imports (diagnostics)
+            raw_weekly = import_df_safely(nfl.import_weekly_data, [season_val])
+            raw_season = import_df_safely(nfl.import_seasonal_data, [season_val])
 
-            try:
-                raw_seasonal = nfl.import_seasonal_data([int(season_input)])
-                sz_season = raw_seasonal
-            except Exception as e:
-                st.warning(f"Seasonal import failed: {e}")
+            st.caption(f"Diagnostics — weekly rows: {len(raw_weekly)} | seasonal rows: {len(raw_season)}")
+            if not raw_weekly.empty and 'season' in raw_weekly.columns:
+                try: st.caption(f"Weekly unique seasons: {sorted(set(raw_weekly['season']))}")
+                except: pass
+            if not raw_season.empty and 'season' in raw_season.columns:
+                try: st.caption(f"Seasonal unique seasons: {sorted(set(raw_season['season']))}")
+                except: pass
 
-            # Diagnostics
-            st.caption(
-                f"Diagnostics — weekly rows: {0 if sz_week is None else len(sz_week)} | "
-                f"seasonal rows: {0 if sz_season is None else len(sz_season)}"
-            )
-            if sz_week is not None and not sz_week.empty and 'season' in sz_week.columns:
-                try:
-                    st.caption(f"Weekly unique seasons: {sorted(set(sz_week['season']))}")
-                except Exception:
-                    pass
-            if sz_season is not None and not sz_season.empty and 'season' in sz_season.columns:
-                try:
-                    st.caption(f"Seasonal unique seasons: {sorted(set(sz_season['season']))}")
-                except Exception:
-                    pass
-
-            # Use normalized wrapper for actual week/team pull
-            dfw = fetch_week_stats(int(season_input), int(week_input), NFL_TEAM)
+            # Use normalized wrapper (tries weekly then seasonal)
+            dfw = fetch_week_stats(season_val, week_val, NFL_TEAM)
 
             if dfw.empty:
                 st.warning(
-                    "No weekly rows found for this season/week/team and seasonal fallback was empty. "
-                    "This usually means the selected season/week isn't published in nfl-data-py yet. "
-                    "Try switching Season to 2024 to test, or upload CSVs in section 2."
+                    "No rows for this Season/Week/Team, and seasonal fallback was empty. "
+                    "If you selected a season that isn't published yet, try Season=2024, "
+                    "or upload CSVs in section 2 to backfill."
                 )
             else:
-                # Normalize keys
-                dfw["season"] = dfw.get("season", int(season_input))
-                dfw["week"]   = dfw.get("week", int(week_input))
+                # Normalize keys & dedupe-friendly
+                dfw["season"] = dfw.get("season", season_val)
+                dfw["week"]   = dfw.get("week", week_val)
                 dfw["team"]   = dfw.get("team", NFL_TEAM)
                 dfw = dfw.loc[:, ~dfw.columns.duplicated()]
 
                 # Append to Offense & Defense (mirrored storage)
-                _off = append_to_sheet(
-                    EXCEL_PATH, SHEET_OFFENSE, dfw,
-                    dedupe_on=["season", "week", "team"]
-                )
-                _def = append_to_sheet(
-                    EXCEL_PATH, SHEET_DEFENSE, dfw,
-                    dedupe_on=["season", "week", "team"]
-                )
+                _off = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, dfw,
+                                       dedupe_on=["season", "week", "team"])
+                _def = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, dfw,
+                                       dedupe_on=["season", "week", "team"])
 
                 st.success(
-                    f"Saved {int(season_input)} Week {int(week_input)}: "
-                    f"Offense rows={len(_off)} • Defense rows={len(_def)}"
+                    f"Saved {season_val} Week {week_val}: Offense rows={len(_off)} • Defense rows={len(_def)}"
                 )
                 st.dataframe(dfw.head(50), width="stretch")
 
@@ -807,4 +809,3 @@ with st.expander("6) Exports & Downloads", expanded=True):
 
     except Exception as e:
         st.error(f"Peek failed: {e}")
-
