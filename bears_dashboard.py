@@ -610,7 +610,6 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
                 nums = select_numeric(chi_wk)
                 preview = pd.concat([chi_wk[ids + nums].reset_index(drop=True),
                                      nfl_week_avg_row.reset_index(drop=True)], axis=1)
-                # simple green/red style without external Styler import
                 def _cell_color(val, base_col):
                     nfl_col = f"NFL_Avg._{base_col}"
                     if nfl_col not in preview.columns:
@@ -622,9 +621,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
                 def _apply(row):
                     styles = []
                     for c in preview.columns:
-                        if c in ids:
-                            styles.append("")
-                        elif c.startswith("NFL_Avg._"):
+                        if c in ids or c.startswith("NFL_Avg._"):
                             styles.append("")
                         else:
                             styles.append(_cell_color(row[c], c))
