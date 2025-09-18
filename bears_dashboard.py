@@ -45,7 +45,7 @@ ALL_SHEETS = [
 ]
 
 NFL_TEAM = "CHI"
-DEFAULT_SEASON = 2024
+DEFAULT_SEASON = 2024  # set to 2025 when the provider publishes weekly data
 
 # --- Safe import wrapper ---
 def import_df_safely(import_fn, seasons):
@@ -601,6 +601,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
             opp_show = opp_show.add_suffix("_OPP")
             merged = pd.concat([chi_show.reset_index(drop=True), opp_show.reset_index(drop=True)], axis=1)
             st.dataframe(merged, width="stretch")
+
         st.markdown("**Bears vs NFL Average — This Week**")
         if not chi_wk.empty:
             if nfl_week_avg_row is None or nfl_week_avg_row.empty:
@@ -629,18 +630,15 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
                 st.dataframe(preview.style.apply(_apply, axis=1), width="stretch")
         else:
             st.caption("No CHI weekly row to compare for this week.")
-        st.markdown("**Snap Counts (Week comparison, if available)**")
-        chi_sn, opp_sn = fetch_snap_counts_week_both(int(season_input), int(week_input), NFL_TEAM, opponent_input)
-        if chi_sn.empty and opp_sn.empty:
-            st.caption("No snap counts for this week from the source.")
+
+        # ---- SNAP COUNTS: BEARS ONLY (opponent removed) ----
+        st.markdown("**Snap Counts (This Week — Bears only)**")
+        chi_sn, _ = fetch_snap_counts_week_both(int(season_input), int(week_input), NFL_TEAM, opponent_input)
+        if chi_sn.empty:
+            st.caption("No CHI snap counts for this week from the source. Use sidebar → Fetch Snap Counts or upload CSV in Section 2.")
         else:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("Bears Snap Counts")
-                st.dataframe(chi_sn.head(50), width="stretch")
-            with col2:
-                st.write(f"{opponent_input} Snap Counts")
-                st.dataframe(opp_sn.head(50), width="stretch")
+            st.dataframe(chi_sn.head(50), width="stretch")
+
         st.markdown("**This Week Snap Counts (center display)**")
         chi_sn_all = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
         chi_sn_week = filter_week(chi_sn_all.copy(), int(season_input), int(week_input))
@@ -648,6 +646,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
             st.caption("No CHI snap counts saved for this week yet. Use sidebar → Fetch Snap Counts or upload CSV in Section 2.")
         else:
             st.dataframe(chi_sn_week.head(50), width="stretch")
+
     with tabs[1]:
         st.caption("Bears averages across weeks 1..W vs NFL averages across the same weeks.")
         bears_ytd = fetch_bears_averages_YTD_from_source(int(season_input), int(week_input), NFL_TEAM)
@@ -753,6 +752,7 @@ with st.expander("6) Exports & Downloads", expanded=True):
             )
     else:
         st.info("Excel not found yet; upload a CSV or fetch to create it.")
+
     st.markdown("**Workbook Peek**")
     cols = st.columns(3)
     try:
