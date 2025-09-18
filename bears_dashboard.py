@@ -15,10 +15,14 @@ from urllib.error import HTTPError, URLError
 
 # --- App setup ---
 st.set_page_config(page_title="Bears Weekly Tracker", layout="wide")
+
 DATA_DIR = "./data"
 EXPORTS_DIR = "./exports"
+CSV_DIR = "./csv"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(EXPORTS_DIR, exist_ok=True)
+os.makedirs(CSV_DIR, exist_ok=True)
+
 EXCEL_PATH = os.path.join(DATA_DIR, "bears_weekly_analytics.xlsx")
 
 # Sheet names
@@ -45,7 +49,7 @@ ALL_SHEETS = [
 ]
 
 NFL_TEAM = "CHI"
-DEFAULT_SEASON = 2024  # set to 2025 when the provider publishes weekly data
+DEFAULT_SEASON = 2025   # your default; can change in sidebar
 
 # --- Safe import wrapper ---
 def import_df_safely(import_fn, seasons):
@@ -118,6 +122,21 @@ def append_to_sheet(path, sheet, df_new, dedupe_on=None):
     write_sheet(path, sheet, df_out)
     return df_out
 
+# --- CSV helpers ---
+def csv_name(base, season, week, team):
+    return os.path.join(CSV_DIR, f"{base}_{int(season)}_W{int(week):02d}_{team}.csv")
+
+def save_csv(df, base, season, week, team):
+    path = csv_name(base, season, week, team)
+    try:
+        df.to_csv(path, index=False)
+        return path
+    except Exception:
+        # ensure directory exists and try again
+        os.makedirs(CSV_DIR, exist_ok=True)
+        df.to_csv(path, index=False)
+        return path
+
 # --- NFL helpers ---
 def _normalize_team_col(df):
     if df.empty:
@@ -134,6 +153,7 @@ def select_numeric(df):
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
 def fetch_week_stats(season, week, team_abbr):
+    # Try weekly; if empty, fallback to seasonal (tag with week)
     try:
         weekly = import_df_safely(nfl.import_weekly_data, [season])
         weekly = _normalize_team_col(weekly)
@@ -365,7 +385,7 @@ def build_pdf_summary_lines(season, week, opponent):
 # --- Sidebar ---
 st.sidebar.title("Controls")
 season_input = st.sidebar.number_input("Season", min_value=2012, max_value=2030, value=DEFAULT_SEASON, step=1)
-week_input = st.sidebar.number_input("Week", min_value=1, max_value=22, value=1, step=1)
+week_input = st.sidebar.number_input("Week", min_value=1, max_value=22, value=2, step=1)
 opponent_input = st.sidebar.text_input("Opponent (3-letter code)", value="MIN").strip().upper()
 
 st.sidebar.markdown("---")
@@ -403,6 +423,40 @@ if st.sidebar.button("Fetch Snap Counts"):
 
 st.sidebar.subheader("Color Codes (Auto)")
 st.sidebar.caption("Green = better than NFL average; Red = worse (direction-aware).")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("CSV Outputs")
+st.sidebar.caption("Write auto-fetched data directly into CSV files under ./csv/")
+# These buttons are also duplicated in Section 1 for convenience
+if st.sidebar.button("Write Weekly CSVs (Auto)"):
+    season_val = int(season_input); week_val = int(week_input)
+    chi_wk, opp_wk = fetch_week_stats_both_teams(season_val, week_val, NFL_TEAM, opponent_input)
+    if chi_wk.empty and opp_wk.empty:
+        st.sidebar.error("No weekly rows from source yet; cannot write weekly CSVs.")
+    else:
+        if not chi_wk.empty:
+            path_off = save_csv(chi_wk.copy(), "Offense", season_val, week_val, NFL_TEAM)
+            path_def = save_csv(chi_wk.copy(), "Defense", season_val, week_val, NFL_TEAM)
+            st.sidebar.success(f"Wrote Bears weekly CSVs:\n• {os.path.basename(path_off)}\n• {os.path.basename(path_def)}")
+        if not opp_wk.empty:
+            path_off_o = save_csv(opp_wk.copy(), "Offense", season_val, week_val, opponent_input)
+            path_def_o = save_csv(opp_wk.copy(), "Defense", season_val, week_val, opponent_input)
+            st.sidebar.success(f"Wrote Opponent weekly CSVs:\n• {os.path.basename(path_off_o)}\n• {os.path.basename(path_def_o)}")
+
+if st.sidebar.button("Write SnapCount CSVs (Auto)"):
+    season_val = int(season_input); week_val = int(week_input)
+    chi_sn, opp_sn = fetch_snap_counts_week_both(season_val, week_val, NFL_TEAM, opponent_input)
+    wrote_any = False
+    if not chi_sn.empty:
+        p = save_csv(chi_sn.copy(), "SnapCounts", season_val, week_val, NFL_TEAM)
+        st.sidebar.success(f"Wrote Bears SnapCounts CSV: {os.path.basename(p)}")
+        wrote_any = True
+    if not opp_sn.empty:
+        p = save_csv(opp_sn.copy(), "SnapCounts", season_val, week_val, opponent_input)
+        st.sidebar.success(f"Wrote Opponent SnapCounts CSV: {os.path.basename(p)}")
+        wrote_any = True
+    if not wrote_any:
+        st.sidebar.error("No snap counts available from source to write.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Downloads")
@@ -444,10 +498,11 @@ with c3:
 
 # 1) Weekly Controls
 with st.expander("1) Weekly Controls", expanded=True):
+    st.info("If weekly imports 404 for 2025, use these anyway—once the source publishes, the same buttons will save to CSV automatically.")
     cc1, cc2 = st.columns(2)
     with cc1:
         st.markdown("**Quick Fetch (This Week)**")
-        if st.button("Fetch CHI Week Stats (Auto)"):
+        if st.button("Fetch & Append CHI Week to Workbook (Auto)"):
             season_val = int(season_input)
             week_val = int(week_input)
             raw_weekly = import_df_safely(nfl.import_weekly_data, [season_val])
@@ -455,7 +510,7 @@ with st.expander("1) Weekly Controls", expanded=True):
             st.caption(f"Diagnostics — weekly rows: {len(raw_weekly)} | seasonal rows: {len(raw_season)}")
             dfw = fetch_week_stats(season_val, week_val, NFL_TEAM)
             if dfw.empty:
-                st.warning("No rows for this Season/Week/Team. If the season isn't published yet, upload CSVs in section 2.")
+                st.warning("No CHI rows for this Season/Week. When the season is published, this will populate automatically.")
             else:
                 dfw["season"] = dfw.get("season", season_val)
                 dfw["week"]   = dfw.get("week", week_val)
@@ -463,8 +518,42 @@ with st.expander("1) Weekly Controls", expanded=True):
                 dfw = dfw.loc[:, ~dfw.columns.duplicated()]
                 _off = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, dfw, dedupe_on=["season", "week", "team"])
                 _def = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, dfw, dedupe_on=["season", "week", "team"])
-                st.success(f"Saved {season_val} Week {week_val}: Offense rows={len(_off)} • Defense rows={len(_def)}")
+                # Also write CSVs for your workflow
+                path_off = save_csv(dfw, "Offense", season_val, week_val, NFL_TEAM)
+                path_def = save_csv(dfw, "Defense", season_val, week_val, NFL_TEAM)
+                st.success(f"Workbook updated. CSVs written:\n• {os.path.basename(path_off)}\n• {os.path.basename(path_def)}")
                 st.dataframe(dfw.head(50), width="stretch")
+
+        if st.button("Fetch & Write Opponent Week CSV (Auto)"):
+            season_val = int(season_input)
+            week_val = int(week_input)
+            opp_df = fetch_week_stats(season_val, week_val, opponent_input)
+            if opp_df.empty:
+                st.warning("No opponent weekly rows yet.")
+            else:
+                opp_df["season"] = opp_df.get("season", season_val)
+                opp_df["week"]   = opp_df.get("week", week_val)
+                opp_df["team"]   = opp_df.get("team", opponent_input)
+                opp_df = opp_df.loc[:, ~opp_df.columns.duplicated()]
+                p1 = save_csv(opp_df, "Offense", season_val, week_val, opponent_input)
+                p2 = save_csv(opp_df, "Defense", season_val, week_val, opponent_input)
+                st.success(f"Opponent CSVs written:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
+
+        if st.button("Fetch & Write SnapCount CSVs (Auto)"):
+            season_val = int(season_input); week_val = int(week_input)
+            chi_sn, opp_sn = fetch_snap_counts_week_both(season_val, week_val, NFL_TEAM, opponent_input)
+            wrote = False
+            if not chi_sn.empty:
+                p = save_csv(chi_sn, "SnapCounts", season_val, week_val, NFL_TEAM)
+                st.success(f"Bears SnapCounts CSV: {os.path.basename(p)}")
+                wrote = True
+            if not opp_sn.empty:
+                p = save_csv(opp_sn, "SnapCounts", season_val, week_val, opponent_input)
+                st.success(f"Opponent SnapCounts CSV: {os.path.basename(p)}")
+                wrote = True
+            if not wrote:
+                st.warning("No snap counts available to write yet.")
+
     with cc2:
         st.markdown("**Notes / Key Items**")
         key_notes = st.text_area("Quick Notes (saved under OpponentPreview)", height=120)
@@ -486,7 +575,7 @@ with st.expander("1) Weekly Controls", expanded=True):
 
 # 2) Upload Weekly Data
 with st.expander("2) Upload Weekly Data", expanded=True):
-    st.caption("Upload Offense/Defense/Personnel/SnapCounts CSVs. Rows are appended and deduped.")
+    st.caption("Upload Offense/Defense/Personnel/SnapCounts/Injuries CSVs. Rows are appended and deduped.")
     upc1, upc2 = st.columns(2)
     with upc1:
         st.markdown("**Offense CSV**")
@@ -502,6 +591,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 st.success(f"Offense rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
+
         st.markdown("**Defense CSV**")
         f_def = st.file_uploader("Upload Defense CSV", type=["csv"], key="up_def")
         if f_def is not None:
@@ -515,6 +605,22 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 st.success(f"Defense rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
+
+        st.markdown("**Injuries CSV**")
+        f_inj = st.file_uploader("Upload Injuries CSV", type=["csv"], key="up_inj")
+        if f_inj is not None:
+            try:
+                df = pd.read_csv(f_inj)
+                df["season"] = df.get("season", int(season_input))
+                df["week"] = df.get("week", int(week_input))
+                df["team"] = df.get("team", NFL_TEAM)
+                df = df.loc[:, ~df.columns.duplicated()]
+                df_out = append_to_sheet(EXCEL_PATH, SHEET_INJURIES, df,
+                                         dedupe_on=[c for c in ["season", "week", "team", "player"] if c in df.columns])
+                st.success(f"Injuries rows now: {len(df_out)}")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
     with upc2:
         st.markdown("**Personnel CSV**")
         f_per = st.file_uploader("Upload Personnel CSV", type=["csv"], key="up_per")
@@ -529,6 +635,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 st.success(f"Personnel rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
+
         st.markdown("**Snap Counts CSV (Manual)**")
         f_snap = st.file_uploader("Upload Snap Counts CSV", type=["csv"], key="up_snap")
         if f_snap is not None:
@@ -555,6 +662,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
         st.dataframe(off_view, width="stretch")
     else:
         st.info("No auto NFL YTD averages yet.")
+
     st.markdown("---")
     st.write("**NFL Weekly Averages (per-week, Auto)**")
     wkavg = read_sheet(EXCEL_PATH, SHEET_NFL_WEEKLY_AVG)
@@ -562,6 +670,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
         st.dataframe(wkavg.tail(5), width="stretch")
     else:
         st.caption("Will appear after Fetch NFL Data (Auto) succeeds.")
+
     st.markdown("---")
     st.write("**Selected Week NFL Average (Auto)**")
     nfl_week_avg_row = nfl_week_average(int(season_input), int(week_input))
@@ -569,6 +678,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
         st.caption("No league average for this week (week file not available yet).")
     else:
         st.dataframe(nfl_week_avg_row, width="stretch")
+
     st.markdown("---")
     st.markdown("**Manual NFL Averages CSV** (optional). Columns will be prefixed to `NFL_Avg._` for styling.")
     f_nfl = st.file_uploader("Upload Manual NFL Averages CSV", type=["csv"], key="up_nflavg")
@@ -585,6 +695,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
 # 4) Color Codes & Comparisons
 with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
     tabs = st.tabs(["Bears vs Opponent (This Week)", "Bears YTD vs NFL (Weeks 1..W)"])
+
     with tabs[0]:
         st.caption("Side-by-side comparison for the selected week using remote weekly data when available.")
         chi_wk, opp_wk = fetch_week_stats_both_teams(int(season_input), int(week_input), NFL_TEAM, opponent_input)
@@ -631,7 +742,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
         else:
             st.caption("No CHI weekly row to compare for this week.")
 
-        # ---- SNAP COUNTS: BEARS ONLY (opponent removed) ----
+        # ---- SNAP COUNTS: BEARS ONLY ----
         st.markdown("**Snap Counts (This Week — Bears only)**")
         chi_sn, _ = fetch_snap_counts_week_both(int(season_input), int(week_input), NFL_TEAM, opponent_input)
         if chi_sn.empty:
@@ -694,21 +805,25 @@ with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
 # 6) Exports & Downloads
 with st.expander("6) Exports & Downloads", expanded=True):
     st.caption("Create week-only Excel, final PDF, and download the full workbook.")
+
     st.markdown("**Weekly Excel (This Week)**")
-    if st.button("Create Weekly Excel (Off/Def/Personnel/Snaps)"):
+    if st.button("Create Weekly Excel (Off/Def/Personnel/Snaps/Injuries)"):
         season_val = int(season_input); week_val = int(week_input)
         off = filter_week(read_sheet(EXCEL_PATH, SHEET_OFFENSE), season_val, week_val)
         deff = filter_week(read_sheet(EXCEL_PATH, SHEET_DEFENSE), season_val, week_val)
         per = filter_week(read_sheet(EXCEL_PATH, SHEET_PERSONNEL), season_val, week_val)
         snaps = filter_week(read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS), season_val, week_val)
+        inj = filter_week(read_sheet(EXCEL_PATH, SHEET_INJURIES), season_val, week_val)
         chi_wk, opp_wk = fetch_week_stats_both_teams(season_val, week_val, NFL_TEAM, opponent_input)
         nfl_wk = nfl_week_average(season_val, week_val)
+
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as xlw:
             if not off.empty:   off.to_excel(xlw, index=False, sheet_name="Offense")
             if not deff.empty:  deff.to_excel(xlw, index=False, sheet_name="Defense")
             if not per.empty:   per.to_excel(xlw, index=False, sheet_name="Personnel")
             if not snaps.empty: snaps.to_excel(xlw, index=False, sheet_name="SnapCounts")
+            if not inj.empty:   inj.to_excel(xlw, index=False, sheet_name="Injuries")
             if not chi_wk.empty: chi_wk.to_excel(xlw, index=False, sheet_name="CHI_Week")
             if not opp_wk.empty: opp_wk.to_excel(xlw, index=False, sheet_name=f"{opponent_input}_Week")
             if nfl_wk is not None and not nfl_wk.empty: nfl_wk.to_excel(xlw, index=False, sheet_name="NFL_Week_Avg")
@@ -720,6 +835,7 @@ with st.expander("6) Exports & Downloads", expanded=True):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
+
     st.markdown("---")
     if st.button("Export Final PDF (This Week)"):
         try:
@@ -741,6 +857,7 @@ with st.expander("6) Exports & Downloads", expanded=True):
                 )
         except Exception as e:
             st.error(f"PDF export failed: {e}")
+
     st.markdown("---")
     if os.path.exists(EXCEL_PATH):
         with open(EXCEL_PATH, "rb") as f:
@@ -759,14 +876,33 @@ with st.expander("6) Exports & Downloads", expanded=True):
         with cols[0]:
             st.write("Offense")
             off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
-            st.dataframe(off.tail(10), width="stretch") if not off.empty else st.caption("—")
+            if not off.empty:
+                st.dataframe(off.tail(10), width="stretch")
+            else:
+                st.caption("—")
+
         with cols[1]:
             st.write("Defense")
             deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
-            st.dataframe(deff.tail(10), width="stretch") if not deff.empty else st.caption("—")
+            if not deff.empty:
+                st.dataframe(deff.tail(10), width="stretch")
+            else:
+                st.caption("—")
+
         with cols[2]:
             st.write("SnapCounts")
             snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
-            st.dataframe(snaps.tail(10), width="stretch") if not snaps.empty else st.caption("—")
+            if not snaps.empty:
+                st.dataframe(snaps.tail(10), width="stretch")
+            else:
+                st.caption("—")
+
+        st.write("Injuries")
+        inj = read_sheet(EXCEL_PATH, SHEET_INJURIES)
+        if not inj.empty:
+            st.dataframe(inj.tail(10), width="stretch")
+        else:
+            st.caption("—")
+
     except Exception as e:
         st.error(f"Peek failed: {e}")
