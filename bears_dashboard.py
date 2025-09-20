@@ -149,7 +149,7 @@ def save_csv(df, base, season, week, team):
     return path
 
 # ---------------------------
-# Small utils
+# Small utils (NEW: de-dup columns + numeric check)
 # ---------------------------
 def _normalize_team_col(df):
     if df.empty:
@@ -164,6 +164,34 @@ def _normalize_team_col(df):
 
 def select_numeric(df):
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure DataFrame has unique column names for Arrow/Streamlit."""
+    if df is None or df.empty:
+        return df
+    cols = list(df.columns)
+    seen = {}
+    new_cols = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 1
+            new_cols.append(c)
+        else:
+            k = seen[c]
+            seen[c] = k + 1
+            new_cols.append(f"{c}.{k}")  # append a numeric suffix
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+def has_meaningful_numeric(df: pd.DataFrame) -> bool:
+    """True if the df has any numeric column with at least one non-null value."""
+    if df is None or df.empty:
+        return False
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if not numeric_cols:
+        return False
+    return pd.notna(df[numeric_cols]).any().any()
 
 # ---------------------------
 # GitHub Release asset discovery (avoids hard-coded filenames)
@@ -811,18 +839,18 @@ if st.sidebar.button("Write Weekly CSVs (Auto)"):
         chi = bears_row_for_week(team_week, season_val, week_val, NFL_TEAM)
         opp = bears_row_for_week(team_week, season_val, week_val, opponent_input)
         wrote = False
-        if not chi.empty:
-            p1 = save_csv(chi, "Offense", season_val, week_val, NFL_TEAM)
-            p2 = save_csv(chi, "Defense", season_val, week_val, NFL_TEAM)
+        if not chi.empty and has_meaningful_numeric(chi):
+            p1 = save_csv(make_unique_columns(chi), "Offense", season_val, week_val, NFL_TEAM)
+            p2 = save_csv(make_unique_columns(chi), "Defense", season_val, week_val, NFL_TEAM)
             st.sidebar.success(f"Wrote Bears weekly CSVs:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
             wrote = True
-        if not opp.empty:
-            p1 = save_csv(opp, "Offense", season_val, week_val, opponent_input)
-            p2 = save_csv(opp, "Defense", season_val, week_val, opponent_input)
+        if not opp.empty and has_meaningful_numeric(opp):
+            p1 = save_csv(make_unique_columns(opp), "Offense", season_val, week_val, opponent_input)
+            p2 = save_csv(make_unique_columns(opp), "Defense", season_val, week_val, opponent_input)
             st.sidebar.success(f"Wrote Opponent weekly CSVs:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
             wrote = True
         if not wrote:
-            st.sidebar.info("No CHI/OPP rows yet in weekly table; try later.")
+            st.sidebar.info("No CHI/OPP rows with numeric values yet; try later.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Downloads")
@@ -899,7 +927,7 @@ with st.expander("1) Weekly Controls", expanded=True):
             team_week = resolve_team_week_table(season_val, prefer_week=week_val)
             st.caption(f"Weekly table rows: {len(team_week)} (showing first few)")
             if not team_week.empty:
-                st.dataframe(team_week.head(10), use_container_width=True)
+                st.dataframe(make_unique_columns(team_week.head(10)), use_container_width=True)
 
             chi = bears_row_for_week(team_week, season_val, week_val, NFL_TEAM)
 
@@ -911,20 +939,23 @@ with st.expander("1) Weekly Controls", expanded=True):
             if chi.empty:
                 st.warning(
                     "No CHI weekly row available yet from team-week, player-week, ESPN, or PBP. "
-                    "This usually means the weekly assets haven’t been posted yet. "
-                    "Try again later or upload your CSVs in Section 2."
+                    "This usually means the weekly assets haven’t been posted yet."
                 )
             else:
                 for col, val in (("season", season_val), ("week", week_val), ("team", NFL_TEAM)):
                     if col not in chi.columns:
                         chi[col] = val
-                chi = chi.loc[:, ~chi.columns.duplicated()]
-                _off = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, chi, dedupe_on=["season", "week", "team"])
-                _def = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, chi, dedupe_on=["season", "week", "team"])
-                p1 = save_csv(chi, "Offense", season_val, week_val, NFL_TEAM)
-                p2 = save_csv(chi, "Defense", season_val, week_val, NFL_TEAM)
-                st.success(f"Workbook updated. CSVs written:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
-                st.dataframe(chi.head(50), width="stretch")
+                chi = make_unique_columns(chi)
+
+                if not has_meaningful_numeric(chi):
+                    st.info("Fetched a CHI row but it has no numeric values yet; not writing to workbook/CSVs.")
+                else:
+                    _off = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, chi, dedupe_on=["season", "week", "team"])
+                    _def = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, chi, dedupe_on=["season", "week", "team"])
+                    p1 = save_csv(chi, "Offense", season_val, week_val, NFL_TEAM)
+                    p2 = save_csv(chi, "Defense", season_val, week_val, NFL_TEAM)
+                    st.success(f"Workbook updated. CSVs written:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
+                    st.dataframe(make_unique_columns(chi.head(50)), width="stretch")
 
         if st.button("Fetch & Write Opponent Week CSV (Direct+Fallbacks)"):
             season_val, week_val = int(season_input), int(week_input)
@@ -941,21 +972,25 @@ with st.expander("1) Weekly Controls", expanded=True):
                 for col, val in (("season", season_val), ("week", week_val), ("team", opponent_input)):
                     if col not in opp.columns:
                         opp[col] = val
-                opp = opp.loc[:, ~opp.columns.duplicated()]
-                p1 = save_csv(opp, "Offense", season_val, week_val, opponent_input)
-                p2 = save_csv(opp, "Defense", season_val, week_val, opponent_input)
-                st.success(f"Opponent CSVs written:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
+                opp = make_unique_columns(opp)
+
+                if not has_meaningful_numeric(opp):
+                    st.info("Fetched an OPP row but it has no numeric values yet; not writing CSVs.")
+                else:
+                    p1 = save_csv(opp, "Offense", season_val, week_val, opponent_input)
+                    p2 = save_csv(opp, "Defense", season_val, week_val, opponent_input)
+                    st.success(f"Opponent CSVs written:\n• {os.path.basename(p1)}\n• {os.path.basename(p2)}")
 
         if st.button("Fetch & Write SnapCount CSVs (Auto)"):
             season_val, week_val = int(season_input), int(week_input)
             chi_sn, opp_sn = fetch_snap_counts_week_both(season_val, week_val, NFL_TEAM, opponent_input)
             wrote = False
             if not chi_sn.empty:
-                p = save_csv(chi_sn, "SnapCounts", season_val, week_val, NFL_TEAM)
+                p = save_csv(make_unique_columns(chi_sn), "SnapCounts", season_val, week_val, NFL_TEAM)
                 st.success(f"Bears SnapCounts CSV: {os.path.basename(p)}")
                 wrote = True
             if not opp_sn.empty:
-                p = save_csv(opp_sn, "SnapCounts", season_val, week_val, opponent_input)
+                p = save_csv(make_unique_columns(opp_sn), "SnapCounts", season_val, week_val, opponent_input)
                 st.success(f"Opponent SnapCounts CSV: {os.path.basename(p)}")
                 wrote = True
             if not wrote:
@@ -992,7 +1027,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df = pd.read_csv(f_off)
                 for col, val in (("season", int(season_input)), ("week", int(week_input)), ("team", NFL_TEAM)):
                     if col not in df.columns: df[col] = val
-                df = df.loc[:, ~df.columns.duplicated()]
+                df = make_unique_columns(df.loc[:, ~df.columns.duplicated()])
                 df_out = append_to_sheet(EXCEL_PATH, SHEET_OFFENSE, df, dedupe_on=["season", "week", "team"])
                 st.success(f"Offense rows now: {len(df_out)}")
             except Exception as e:
@@ -1005,7 +1040,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df = pd.read_csv(f_def)
                 for col, val in (("season", int(season_input)), ("week", int(week_input)), ("team", NFL_TEAM)):
                     if col not in df.columns: df[col] = val
-                df = df.loc[:, ~df.columns.duplicated()]
+                df = make_unique_columns(df.loc[:, ~df.columns.duplicated()])
                 df_out = append_to_sheet(EXCEL_PATH, SHEET_DEFENSE, df, dedupe_on=["season", "week", "team"])
                 st.success(f"Defense rows now: {len(df_out)}")
             except Exception as e:
@@ -1018,10 +1053,10 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df = pd.read_csv(f_inj)
                 for col, val in (("season", int(season_input)), ("week", int(week_input)), ("team", NFL_TEAM)):
                     if col not in df.columns: df[col] = val
-                df = df.loc[:, ~df.columns.duplicated()]
+                df = make_unique_columns(df.loc[:, ~df.columns.duplicated()])
                 df_out = append_to_sheet(EXCEL_PATH, SHEET_INJURIES, df,
                                          dedupe_on=[c for c in ["season", "week", "team", "player"] if c in df.columns])
-                st.success(f"Injuries rows now: {len[df_out] if hasattr(df_out,'__len__') else 'OK'}")
+                st.success(f"Injuries rows now: {len(df_out)}")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
 
@@ -1033,7 +1068,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df = pd.read_csv(f_per)
                 for col, val in (("season", int(season_input)), ("week", int(week_input)), ("team", NFL_TEAM)):
                     if col not in df.columns: df[col] = val
-                df = df.loc[:, ~df.columns.duplicated()]
+                df = make_unique_columns(df.loc[:, ~df.columns.duplicated()])
                 df_out = append_to_sheet(EXCEL_PATH, SHEET_PERSONNEL, df, dedupe_on=["season", "week", "team"])
                 st.success(f"Personnel rows now: {len(df_out)}")
             except Exception as e:
@@ -1046,7 +1081,7 @@ with st.expander("2) Upload Weekly Data", expanded=True):
                 df = pd.read_csv(f_snap)
                 for col, val in (("season", int(season_input)), ("week", int(week_input)), ("team", NFL_TEAM)):
                     if col not in df.columns: df[col] = val
-                df = df.loc[:, ~df.columns.duplicated()]
+                df = make_unique_columns(df.loc[:, ~df.columns.duplicated()])
                 dedupe_cols = ["season", "week", "team"]
                 if "player" in df.columns:
                     dedupe_cols.append("player")
@@ -1061,7 +1096,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
     off_view = read_sheet(EXCEL_PATH, SHEET_YTD_NFL_OFF)
     if not off_view.empty:
         st.write("**NFL YTD Averages (Auto)**")
-        st.dataframe(off_view, width="stretch")
+        st.dataframe(make_unique_columns(off_view), width="stretch")
     else:
         st.info("No auto NFL YTD averages saved yet.")
 
@@ -1072,7 +1107,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
     if nfl_week_avg_row.empty:
         st.caption("No league average for this week yet.")
     else:
-        st.dataframe(nfl_week_avg_row, width="stretch")
+        st.dataframe(make_unique_columns(nfl_week_avg_row), width="stretch")
 
     st.markdown("---")
     st.markdown("**Manual NFL Averages CSV** (optional). Columns will be prefixed to `NFL_Avg._` for styling.")
@@ -1083,7 +1118,7 @@ with st.expander("3) NFL Averages (Auto & Manual)", expanded=True):
             df.columns = [c if c.startswith("NFL_Avg._") else f"NFL_Avg._{c}" for c in df.columns]
             df_out = append_to_sheet(EXCEL_PATH, SHEET_NFL_AVG_MANUAL, df, dedupe_on=None)
             st.success(f"Saved {len(df)} row(s) to NFL_Averages_Manual.")
-            st.dataframe(df_out.tail(10), width="stretch")
+            st.dataframe(make_unique_columns(df_out.tail(10)), width="stretch")
         except Exception as e:
             st.error(f"Upload failed: {e}")
 
@@ -1106,9 +1141,10 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
                 chi_show = chi[show_cols].add_suffix("_CHI") if not chi.empty else pd.DataFrame(columns=[c+"_CHI" for c in show_cols])
                 opp_show = opp[show_cols].add_suffix("_OPP") if not opp.empty else pd.DataFrame(columns=[c+"_OPP" for c in show_cols])
                 merged = pd.concat([chi_show.reset_index(drop=True), opp_show.reset_index(drop=True)], axis=1)
+                merged = make_unique_columns(merged)
                 st.dataframe(merged, width="stretch")
             else:
-                st.dataframe(pd.concat([chi, opp], ignore_index=True), width="stretch")
+                st.dataframe(make_unique_columns(pd.concat([chi, opp], ignore_index=True)), width="stretch")
 
         st.markdown("**Bears vs NFL Average — This Week**")
         nfl_week_avg_row = nfl_week_average_from_table(team_week, int(week_input))
@@ -1133,7 +1169,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
                     else:
                         styles.append(_cell_color(row[c], c))
                 return styles
-            st.dataframe(preview.style.apply(_apply, axis=1), width="stretch")
+            st.dataframe(make_unique_columns(preview).style.apply(_apply, axis=1), width="stretch")
         else:
             st.caption("Need CHI row and NFL week average to color-code.")
 
@@ -1142,7 +1178,7 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
         if chi_sn.empty:
             st.caption("No CHI snap counts this week yet.")
         else:
-            st.dataframe(chi_sn.head(50), width="stretch")
+            st.dataframe(make_unique_columns(chi_sn.head(50)), width="stretch")
 
     with tabs[1]:
         team_week = resolve_team_week_table(int(season_input), prefer_week=int(week_input))
@@ -1151,7 +1187,9 @@ with st.expander("4) DVOA Proxy, Color Codes & Comparisons", expanded=True):
         if bears_ytd.empty or nfl_ytd.empty:
             st.info("Need both Bears YTD and NFL YTD (try ‘Fetch NFL Data (Auto)’ after weekly posts).")
         else:
-            st.dataframe(pd.concat([bears_ytd.reset_index(drop=True), nfl_ytd.reset_index(drop=True)], axis=1), width="stretch")
+            st.dataframe(make_unique_columns(pd.concat([bears_ytd.reset_index(drop=True),
+                                                        nfl_ytd.reset_index(drop=True)], axis=1)),
+                         width="stretch")
 
 # 5) Opponent Preview & Strategy Notes
 with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
@@ -1159,7 +1197,7 @@ with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
     opp = read_sheet(EXCEL_PATH, SHEET_OPP_PREVIEW)
     if not opp.empty:
         st.write("**Opponent Preview (Recent)**")
-        st.dataframe(opp.sort_values(opp.columns[0]).tail(25), width="stretch")
+        st.dataframe(make_unique_columns(opp.sort_values(opp.columns[0]).tail(25)), width="stretch")
     else:
         st.info("No opponent preview entries yet.")
     colA, colB = st.columns([2, 1])
@@ -1182,7 +1220,7 @@ with st.expander("5) Opponent Preview & Strategy Notes", expanded=True):
         df_out = append_to_sheet(EXCEL_PATH, SHEET_PREDICTIONS, row,
                                  dedupe_on=["season", "week", "team", "opponent"])
         st.success("Prediction saved.")
-        st.dataframe(df_out.tail(10), width="stretch")
+        st.dataframe(make_unique_columns(df_out.tail(10)), width="stretch")
 
 # 6) Exports & Downloads
 with st.expander("6) Exports & Downloads", expanded=True):
@@ -1207,14 +1245,14 @@ with st.expander("6) Exports & Downloads", expanded=True):
         nfl_wk = nfl_week_average_from_table(team_week, week_val)
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as xlw:
-            if not off.empty:   off.to_excel(xlw, index=False, sheet_name="Offense")
-            if not deff.empty:  deff.to_excel(xlw, index=False, sheet_name="Defense")
-            if not per.empty:   per.to_excel(xlw, index=False, sheet_name="Personnel")
-            if not snaps.empty: snaps.to_excel(xlw, index=False, sheet_name="SnapCounts")
-            if not inj.empty:   inj.to_excel(xlw, index=False, sheet_name="Injuries")
-            if not chi.empty:   chi.to_excel(xlw, index=False, sheet_name="CHI_Week")
-            if not opp.empty:   opp.to_excel(xlw, index=False, sheet_name=f"{opponent_input}_Week")
-            if not nfl_wk.empty: nfl_wk.to_excel(xlw, index=False, sheet_name="NFL_Week_Avg")
+            if not off.empty:   make_unique_columns(off).to_excel(xlw, index=False, sheet_name="Offense")
+            if not deff.empty:  make_unique_columns(deff).to_excel(xlw, index=False, sheet_name="Defense")
+            if not per.empty:   make_unique_columns(per).to_excel(xlw, index=False, sheet_name="Personnel")
+            if not snaps.empty: make_unique_columns(snaps).to_excel(xlw, index=False, sheet_name="SnapCounts")
+            if not inj.empty:   make_unique_columns(inj).to_excel(xlw, index=False, sheet_name="Injuries")
+            if not chi.empty:   make_unique_columns(chi).to_excel(xlw, index=False, sheet_name="CHI_Week")
+            if not opp.empty:   make_unique_columns(opp).to_excel(xlw, index=False, sheet_name=f"{opponent_input}_Week")
+            if not nfl_wk.empty: make_unique_columns(nfl_wk).to_excel(xlw, index=False, sheet_name="NFL_Week_Avg")
         bio.seek(0)
         st.download_button(
             label=f"Download Weekly Excel — {int(season_input)} W{int(week_input):02d}",
@@ -1260,18 +1298,17 @@ with st.expander("6) Exports & Downloads", expanded=True):
         with cols[0]:
             st.write("Offense")
             off = read_sheet(EXCEL_PATH, SHEET_OFFENSE)
-            st.dataframe(off.tail(10), width="stretch") if not off.empty else st.caption("—")
+            st.dataframe(make_unique_columns(off.tail(10)), width="stretch") if not off.empty else st.caption("—")
         with cols[1]:
             st.write("Defense")
             deff = read_sheet(EXCEL_PATH, SHEET_DEFENSE)
-            st.dataframe(deff.tail(10), width="stretch") if not deff.empty else st.caption("—")
+            st.dataframe(make_unique_columns(deff.tail(10)), width="stretch") if not deff.empty else st.caption("—")
         with cols[2]:
             st.write("SnapCounts")
             snaps = read_sheet(EXCEL_PATH, SHEET_SNAP_COUNTS)
-            st.dataframe(snaps.tail(10), width="stretch") if not snaps.empty else st.caption("—")
+            st.dataframe(make_unique_columns(snaps.tail(10)), width="stretch") if not snaps.empty else st.caption("—")
         st.write("Injuries")
         inj = read_sheet(EXCEL_PATH, SHEET_INJURIES)
-        st.dataframe(inj.tail(10), width="stretch") if not inj.empty else st.caption("—")
+        st.dataframe(make_unique_columns(inj.tail(10)), width="stretch") if not inj.empty else st.caption("—")
     except Exception as e:
         st.error(f"Peek failed: {e}")
-
