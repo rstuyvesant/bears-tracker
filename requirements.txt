@@ -3,7 +3,8 @@ pandas==2.3.2
 numpy==2.3.2
 openpyxl==3.1.5
 fpdf==1.7.2
-nfl-data-py==0.3.2
+nfl_data_py==0.3.2
 pyarrow==21.0.0
-fastparquet==2024.11.0
 requests==2.32.5
+matplotlib==3.9.2
+
