@@ -78,7 +78,7 @@ DEF_ALIASES = {
     "EPA/play Allowed": "EPA/Play Allowed",
     "EPA per play Allowed": "EPA/Play Allowed",
     "QBHits": "QB Hits",
-    "Pressures Allowed": "Pressures",  # sometimes mislabeled
+    "Pressures Allowed": "Pressures",
 }
 
 def rename_aliases(df: pd.DataFrame, is_offense: bool) -> pd.DataFrame:
