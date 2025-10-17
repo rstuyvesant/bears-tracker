@@ -1,11 +1,12 @@
 ﻿# bears_dashboard.py
 # ---------------------------------------------
 # Chicago Bears 2025–26 Weekly Tracker Dashboard
-# Full single-file Streamlit app with:
 # - Weekly Controls, Opponent Preview, Injuries
 # - Uploaders (Offense/Defense/Personnel/SnapCounts)
 # - Predictions + PDF report
 # - NFL per-week averages (upload or auto-compute)
+# - Column alias normalization (for easier matching)
+# - Data debug + maintenance tools
 # - Weekly & YTD charts (Bears vs NFL Averages) AT THE BOTTOM
 # ---------------------------------------------
 
@@ -50,6 +51,43 @@ DEF_CANDIDATES = [
 COMMON_WEEK_COLS = ["Week", "week", "WEEK"]
 TEAM_COLS_SKIP_NUMERIC = ("Team", "team", "Opponent", "Opp", "opponent")
 
+# --- Column name aliasing to improve chart matches ---
+OFF_ALIASES = {
+    "ThirdDown%": "3D%",
+    "Third Down%": "3D%",
+    "3rdDown%": "3D%",
+    "RedZone%": "RZ%",
+    "Red Zone%": "RZ%",
+    "Points/G": "PTS/G",
+    "Pts/G": "PTS/G",
+    "Yards/G": "Yds/G",
+    "EPA per play": "EPA/Play",
+    "EPA/play": "EPA/Play",
+    "Success%": "SR%",
+    "Success Rate": "SR%",
+    "Cmp%": "CMP%",
+    "CmpPct": "CMP%",
+}
+DEF_ALIASES = {
+    "3rdDown% Allowed": "3D% Allowed",
+    "ThirdDown% Allowed": "3D% Allowed",
+    "RedZone% Allowed": "RZ% Allowed",
+    "Red Zone% Allowed": "RZ% Allowed",
+    "Points Allowed/G": "Pts Allowed/G",
+    "Yards Allowed/G": "Yds Allowed/G",
+    "EPA/play Allowed": "EPA/Play Allowed",
+    "EPA per play Allowed": "EPA/Play Allowed",
+    "QBHits": "QB Hits",
+    "Pressures Allowed": "Pressures",  # sometimes mislabeled
+}
+
+def rename_aliases(df: pd.DataFrame, is_offense: bool) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    mapping = OFF_ALIASES if is_offense else DEF_ALIASES
+    cols = {c: mapping.get(c, c) for c in df.columns}
+    return df.rename(columns=cols)
+
 # ------------- Utilities -------------
 def ensure_workbook(path: str):
     """Create workbook with required sheets if missing."""
@@ -58,15 +96,16 @@ def ensure_workbook(path: str):
             for s in SHEETS_REQUIRED:
                 pd.DataFrame().to_excel(w, sheet_name=s, index=False)
     else:
-        # ensure all sheets exist
+        # ensure all sheets exist; rewrite minimal workbook if needed
         try:
             with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as w:
                 existing = set(w.book.sheetnames)  # type: ignore[attr-defined]
-                for s in SHEETS_REQUIRED:
-                    if s not in existing:
+                need = [s for s in SHEETS_REQUIRED if s not in existing]
+            if need:
+                with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as w:
+                    for s in need:
                         pd.DataFrame().to_excel(w, sheet_name=s, index=False)
         except Exception:
-            # Fallback: rewrite a minimal workbook with all required sheets (empty)
             with pd.ExcelWriter(path, engine="openpyxl") as w:
                 for s in SHEETS_REQUIRED:
                     pd.DataFrame().to_excel(w, sheet_name=s, index=False)
@@ -157,6 +196,7 @@ def auto_compute_nfl_averages(league_df: pd.DataFrame, metric_group: str) -> pd.
     df = rename_week_to_standard(df)
     df = ensure_week_numeric(df)
     df = coerce_numeric(df)
+    df = rename_aliases(df, is_offense=(metric_group == "off"))
     cands = OFF_CANDIDATES if metric_group == "off" else DEF_CANDIDATES
     cols = ["Week"] + [c for c in cands if c in df.columns]
     if len(cols) == 1:
@@ -235,6 +275,8 @@ with c1:
         df = read_any(off_up)
         df = rename_week_to_standard(df)
         df = ensure_week_numeric(df)
+        df = coerce_numeric(df)
+        df = rename_aliases(df, is_offense=True)
         save_append(df, "Offense", keys=["Week", "Opponent"] if "Opponent" in df.columns else ["Week"])
         st.success("Offense data appended.")
 with c2:
@@ -243,6 +285,8 @@ with c2:
         df = read_any(def_up)
         df = rename_week_to_standard(df)
         df = ensure_week_numeric(df)
+        df = coerce_numeric(df)
+        df = rename_aliases(df, is_offense=False)
         save_append(df, "Defense", keys=["Week", "Opponent"] if "Opponent" in df.columns else ["Week"])
         st.success("Defense data appended.")
 with c3:
@@ -291,12 +335,13 @@ nfl_def_avg = read_any(nfl_def_file)
 league_off_all = read_any(league_off_all_file)
 league_def_all = read_any(league_def_all_file)
 
-for df_name in ["nfl_off_avg", "nfl_def_avg", "league_off_all", "league_def_all", "off", "defn"]:
+for df_name, is_off in [("nfl_off_avg", True), ("nfl_def_avg", False), ("league_off_all", True), ("league_def_all", False)]:
     df = locals()[df_name]
     if not df.empty:
         df = rename_week_to_standard(df)
         df = ensure_week_numeric(df)
         df = coerce_numeric(df)
+        df = rename_aliases(df, is_offense=is_off)
         locals()[df_name] = df
 
 if nfl_off_avg.empty and not league_off_all.empty:
@@ -319,6 +364,19 @@ with cE:
 with cF:
     st.markdown("**NFL Defense Averages (per week)**")
     st.dataframe(make_unique_columns(nfl_def_avg.tail(10)), width="stretch") if not nfl_def_avg.empty else st.caption("—")
+
+# ----- Data Maintenance: delete rows by week (to remove old GB Week 1, etc.) -----
+with st.expander("🧹 Data Maintenance (delete rows by week)"):
+    del_week = st.number_input("Week to delete across all sheets", min_value=1, step=1, format="%d")
+    if st.button("Delete rows for this week (ALL sheets)"):
+        for sheet in ["Offense","Defense","Personnel","SnapCounts","Injuries","OpponentPreview","MediaSummaries","Predictions",
+                      "NFL_Offense_Avg","NFL_Defense_Avg","YTD_Team_Offense","YTD_Team_Defense"]:
+            df = load_sheet(sheet)
+            if not df.empty and "Week" in df.columns:
+                df = df[df["Week"] != int(del_week)]
+                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+                    df.to_excel(w, sheet_name=sheet, index=False)
+        st.success(f"Deleted Week {int(del_week)} from all sheets that had it.")
 
 st.divider()
 
@@ -387,7 +445,6 @@ with st.form("pred_form", clear_on_submit=True):
             "Rationale": rationale.strip(),
             "Timestamp": datetime.now().isoformat(timespec="seconds")
         }])
-        # Dedup on Week+Opponent to avoid duplicates
         save_append(df, "Predictions", keys=["Week", "Opponent"])
         st.success("Prediction saved.")
 preds = load_sheet("Predictions")
@@ -409,7 +466,6 @@ def build_week_pdf(week_num: int, out_path: str):
         if df is None or df.empty:
             pdf.cell(0, 6, "—", ln=1)
             return
-        # Print head + limited rows
         cols = list(df.columns)
         head = " | ".join([str(c)[:15] for c in cols[:6]])
         pdf.cell(0, 5, head, ln=1)
@@ -417,7 +473,6 @@ def build_week_pdf(week_num: int, out_path: str):
             line = " | ".join([str(row.get(c, ""))[:15] for c in cols[:6]])
             pdf.cell(0, 5, line, ln=1)
 
-    # pull week slices
     off_w = off[off["Week"] == week_num] if "Week" in off.columns else pd.DataFrame()
     def_w = defn[defn["Week"] == week_num] if "Week" in defn.columns else pd.DataFrame()
     opp_w = opprev[opprev["Week"] == week_num] if "Week" in opprev.columns else pd.DataFrame()
@@ -465,6 +520,24 @@ st.divider()
 # 6) --- CHARTS AT THE BOTTOM
 # ============================
 
+# Quick debug panel so you can see why charts may not render
+with st.expander("🩺 Data Sanity / Chart Debug"):
+    def cols(df):
+        return list(df.columns) if not df.empty else []
+    # Use the freshest frames available for debug
+    nfl_off_dbg = nfl_off_avg if not nfl_off_avg.empty else load_sheet("NFL_Offense_Avg")
+    nfl_def_dbg = nfl_def_avg if not nfl_def_avg.empty else load_sheet("NFL_Defense_Avg")
+    st.write("Off (rows, cols):", off.shape, "Columns:", cols(off))
+    st.write("Def (rows, cols):", defn.shape, "Columns:", cols(defn))
+    st.write("NFL Off Avg (rows, cols):", (nfl_off_dbg.shape if isinstance(nfl_off_dbg, pd.DataFrame) else (0,0)), "Columns:", cols(nfl_off_dbg))
+    st.write("NFL Def Avg (rows, cols):", (nfl_def_dbg.shape if isinstance(nfl_def_dbg, pd.DataFrame) else (0,0)), "Columns:", cols(nfl_def_dbg))
+    off_overlap = [c for c in OFF_CANDIDATES if c in off.columns and isinstance(nfl_off_dbg, pd.DataFrame) and c in nfl_off_dbg.columns]
+    def_overlap = [c for c in DEF_CANDIDATES if c in defn.columns and isinstance(nfl_def_dbg, pd.DataFrame) and c in nfl_def_dbg.columns]
+    st.write("Offense overlapping metrics:", off_overlap)
+    st.write("Defense overlapping metrics:", def_overlap)
+    st.write("Has Week in Off/NFL-Off:", ("Week" in off.columns), (isinstance(nfl_off_dbg, pd.DataFrame) and "Week" in nfl_off_dbg.columns))
+    st.write("Has Week in Def/NFL-Def:", ("Week" in defn.columns), (isinstance(nfl_def_dbg, pd.DataFrame) and "Week" in nfl_def_dbg.columns))
+
 st.header("6) Charts — Bears vs NFL Averages (Weekly & YTD)")
 st.caption("These charts appear **after** Weekly Controls, Uploads, Opponent Preview, Injuries, Predictions, and Exports.")
 
@@ -478,13 +551,14 @@ nfl_def_avg_sheet = load_sheet("NFL_Defense_Avg")
 nfl_off_avg_chart = nfl_off_avg.copy() if not nfl_off_avg.empty else nfl_off_avg_sheet.copy()
 nfl_def_avg_chart = nfl_def_avg.copy() if not nfl_def_avg.empty else nfl_def_avg_sheet.copy()
 
-# Normalize numeric + Week
-for name in ["off", "defn", "nfl_off_avg_chart", "nfl_def_avg_chart"]:
+# Normalize numeric + Week + aliases again for chart copies
+for name, is_off in [("off", True), ("defn", False), ("nfl_off_avg_chart", True), ("nfl_def_avg_chart", False)]:
     df = locals()[name]
     if not df.empty:
         df = rename_week_to_standard(df)
         df = ensure_week_numeric(df)
         df = coerce_numeric(df)
+        df = rename_aliases(df, is_offense=is_off)
         locals()[name] = df
 
 def plot_weekly(bears_df: pd.DataFrame, nfl_df: pd.DataFrame, title: str, candidates: list[str]):
