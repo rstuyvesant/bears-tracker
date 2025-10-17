@@ -17,6 +17,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from fpdf import FPDF
+
+# >>> Headless plotting fix (must be before pyplot import) <<<
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ------------- Page -------------
@@ -190,7 +194,7 @@ st.sidebar.subheader("Excel")
 export_entire_excel_download()
 
 st.sidebar.divider()
-# ----- Sidebar: NFL averages inputs (corrected lines) -----
+# ----- Sidebar: NFL averages inputs -----
 st.sidebar.subheader("NFL Averages Inputs")
 nfl_off_file = st.sidebar.file_uploader("Upload NFL Offense Averages (per week)", type=["csv", "xlsx"], key="nfl_off")
 nfl_def_file = st.sidebar.file_uploader("Upload NFL Defense Averages (per week)", type=["csv", "xlsx"], key="nfl_def")
