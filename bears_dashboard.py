@@ -1,4 +1,5 @@
 ﻿# bears_dashboard.py
+# bears_dashboard.py
 # ---------------------------------------------
 # Chicago Bears 2025–26 Weekly Tracker Dashboard
 # - Weekly Controls, Opponent Preview, Injuries
