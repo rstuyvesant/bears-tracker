@@ -1,628 +1,600 @@
-﻿# bears_dashboard.py
-# bears_dashboard.py
-# ---------------------------------------------
-# Chicago Bears 2025–26 Weekly Tracker Dashboard
-# - Weekly Controls, Opponent Preview, Injuries
-# - Uploaders (Offense/Defense/Personnel/SnapCounts)
-# - Predictions + PDF report
-# - NFL per-week averages (upload or auto-compute)
-# - Column alias normalization (for easier matching)
-# - Data debug + maintenance tools
-# - Weekly & YTD charts (Bears vs NFL Averages) AT THE BOTTOM
-# ---------------------------------------------
-
-import os
-from datetime import datetime
-from typing import Optional, List
+﻿import io
+import datetime as dt
+from typing import List, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from fpdf import FPDF
 
-# >>> Headless plotting fix (must be before pyplot import) <<<
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# External data package (nflverse)
+import nfl_data_py as nfl
 
-# ------------- Page -------------
-st.set_page_config(page_title="🐻 Chicago Bears 2025–26 Weekly Tracker", layout="wide")
-st.title("🐻 Chicago Bears 2025–26 Weekly Tracker")
-st.caption("Weekly controls → uploads → opponent preview → injuries → predictions → exports → **Charts at the very bottom**")
 
-# ------------- Constants -------------
-EXCEL_FILE = "bears_weekly_analytics.xlsx"
+# -----------------------------
+# App Config
+# -----------------------------
+st.set_page_config(
+    page_title="Bears Weekly Tracker",
+    page_icon="🐻",
+    layout="wide"
+)
 
-SHEETS_REQUIRED = [
-    "Offense", "Defense", "Personnel", "SnapCounts",
-    "Injuries", "OpponentPreview", "MediaSummaries", "Predictions",
-    "YTD_Team_Offense", "YTD_Team_Defense",
-    "NFL_Offense_Avg", "NFL_Defense_Avg"
-]
+# Initialize session storage
+if "approved_weeks" not in st.session_state:
+    st.session_state.approved_weeks = pd.DataFrame()  # holds approved (weekly) rows for CHI, OPP, and snap counts
+if "latest_fetch" not in st.session_state:
+    st.session_state.latest_fetch = {}  # temporary store for fetched-but-not-approved frames
 
-# Candidate columns we try to chart if present
-OFF_CANDIDATES = [
-    "YPA", "YPC", "CMP%", "3D%", "RZ%", "EPA/Play", "SR%", "PTS/G", "Yds/G", "TO/G"
-]
-DEF_CANDIDATES = [
-    "SACK", "INT", "FF", "FR", "QB Hits", "Pressures", "RZ% Allowed", "3D% Allowed",
-    "EPA/Play Allowed", "SR% Allowed", "Pts Allowed/G", "Yds Allowed/G", "DVOA"
-]
 
-COMMON_WEEK_COLS = ["Week", "week", "WEEK"]
-TEAM_COLS_SKIP_NUMERIC = ("Team", "team", "Opponent", "Opp", "opponent")
+# -----------------------------
+# Helpers
+# -----------------------------
+TEAM = "CHI"
+SEASON_DEFAULT = dt.datetime.now().year
 
-# --- Column name aliasing to improve chart matches ---
-OFF_ALIASES = {
-    "ThirdDown%": "3D%",
-    "Third Down%": "3D%",
-    "3rdDown%": "3D%",
-    "RedZone%": "RZ%",
-    "Red Zone%": "RZ%",
-    "Points/G": "PTS/G",
-    "Pts/G": "PTS/G",
-    "Yards/G": "Yds/G",
-    "EPA per play": "EPA/Play",
-    "EPA/play": "EPA/Play",
-    "Success%": "SR%",
-    "Success Rate": "SR%",
-    "Cmp%": "CMP%",
-    "CmpPct": "CMP%",
-}
-DEF_ALIASES = {
-    "3rdDown% Allowed": "3D% Allowed",
-    "ThirdDown% Allowed": "3D% Allowed",
-    "RedZone% Allowed": "RZ% Allowed",
-    "Red Zone% Allowed": "RZ% Allowed",
-    "Points Allowed/G": "Pts Allowed/G",
-    "Yards Allowed/G": "Yds Allowed/G",
-    "EPA/play Allowed": "EPA/Play Allowed",
-    "EPA per play Allowed": "EPA/Play Allowed",
-    "QBHits": "QB Hits",
-    "Pressures Allowed": "Pressures",
+TEAM_ALIASES = {
+    # minimal alias helper if needed
+    "CHI": "CHI"
 }
 
-def rename_aliases(df: pd.DataFrame, is_offense: bool) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    mapping = OFF_ALIASES if is_offense else DEF_ALIASES
-    cols = {c: mapping.get(c, c) for c in df.columns}
-    return df.rename(columns=cols)
+def normalize_week_col(df: pd.DataFrame) -> pd.DataFrame:
+    for c in df.columns:
+        if c.lower() == "week":
+            df = df.rename(columns={c: "Week"})
+            break
+    return df
 
-# ------------- Utilities -------------
-def ensure_workbook(path: str):
-    """Create workbook with required sheets if missing."""
-    if not os.path.exists(path):
-        with pd.ExcelWriter(path, engine="openpyxl") as w:
-            for s in SHEETS_REQUIRED:
-                pd.DataFrame().to_excel(w, sheet_name=s, index=False)
-    else:
-        # ensure all sheets exist; rewrite minimal workbook if needed
-        try:
-            with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as w:
-                existing = set(w.book.sheetnames)  # type: ignore[attr-defined]
-                need = [s for s in SHEETS_REQUIRED if s not in existing]
-            if need:
-                with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as w:
-                    for s in need:
-                        pd.DataFrame().to_excel(w, sheet_name=s, index=False)
-        except Exception:
-            with pd.ExcelWriter(path, engine="openpyxl") as w:
-                for s in SHEETS_REQUIRED:
-                    pd.DataFrame().to_excel(w, sheet_name=s, index=False)
-
-def load_sheet(sheet: str) -> pd.DataFrame:
+def _safe_float_div(n: float, d: float) -> float:
     try:
-        return pd.read_excel(EXCEL_FILE, sheet_name=sheet)
+        if d == 0:
+            return np.nan
+        return n / d
     except Exception:
-        return pd.DataFrame()
+        return np.nan
 
-def save_append(df_new: pd.DataFrame, sheet: str, keys: Optional[List[str]] = None):
-    """Append rows to sheet and deduplicate by keys if provided."""
-    ensure_workbook(EXCEL_FILE)
-    df_old = load_sheet(sheet)
-    if df_old is None or df_old.empty:
-        out = df_new.copy()
-    else:
-        out = pd.concat([df_old, df_new], ignore_index=True)
-    if keys:
-        out = out.drop_duplicates(subset=keys, keep="last")
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-        out.to_excel(w, sheet_name=sheet, index=False)
-
-def export_entire_excel_download():
+def get_opponent_menu(season: int, team: str) -> List[str]:
+    """Create a list of opponent codes for the season using schedules."""
     try:
-        with open(EXCEL_FILE, "rb") as f:
-            st.download_button("📥 Download All Data (Excel)", data=f, file_name=EXCEL_FILE, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except FileNotFoundError:
-        st.caption("Create some data first to enable the full Excel download.")
+        sched = nfl.import_schedules([season])
+        sched = sched[sched["home_team"].notna() & sched["away_team"].notna()]
+        mask = (sched["home_team"] == team) | (sched["away_team"] == team)
+        opps = []
+        for _, r in sched[mask].iterrows():
+            if r["home_team"] == team:
+                opps.append(r["away_team"])
+            else:
+                opps.append(r["home_team"])
+        opps = sorted(list(pd.unique(opps)))
+        return opps if opps else ["GB", "MIN", "DET"]
+    except Exception:
+        return ["GB", "MIN", "DET"]
 
-def read_any(uploaded) -> pd.DataFrame:
-    if uploaded is None:
+
+def import_weekly_player_data(season: int) -> pd.DataFrame:
+    """
+    Pull weekly player-level data (nflverse weekly). We aggregate to team totals.
+    """
+    df = nfl.import_weekly_data([season])  # team, opponent_team, week, season, various stats
+    # ensure expected fields exist (column naming varies with versions)
+    return df
+
+
+def team_week_totals_from_players(weekly_players: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """
+    Aggregate player weekly to team totals for offense perspective.
+    We’ll compute some common team-level metrics robustly based on columns that exist.
+    """
+    df = weekly_players.copy()
+    df = df[(df["season"] == season) & (df["week"] == week)]
+
+    # Some installs use 'recent_team' instead of 'team'
+    team_col = "team" if "team" in df.columns else ("recent_team" if "recent_team" in df.columns else None)
+    opp_col = "opponent_team" if "opponent_team" in df.columns else ("opp_team" if "opp_team" in df.columns else None)
+    if team_col is None or opp_col is None:
+        raise RuntimeError("Expected columns 'team'/'recent_team' and 'opponent_team' not found in weekly data.")
+
+    # Common stat columns in nfl_data_py weekly
+    cols = df.columns.str.lower()
+
+    def pick(*cands) -> Optional[str]:
+        for c in cands:
+            if c.lower() in cols:
+                # return original case from df.columns
+                return df.columns[list(cols).index(c.lower())]
+        return None
+
+    # Offense building blocks
+    pass_yds = pick("passing_yards", "pass_yds", "py")
+    pass_att = pick("attempts", "pass_attempts", "pass_att")
+    pass_cmp = pick("completions", "pass_completions", "cmp")
+    interceptions = pick("interceptions", "int")
+    rush_yds = pick("rushing_yards", "rush_yds", "ry")
+    rush_att = pick("rush_attempts", "rushing_attempts", "ra")
+    fumbles_lost = pick("fumbles_lost", "fum_lost")
+    points = pick("points", "fantasy_points_ppr", "fantasy_points")  # points may not exist; leave NaN if missing
+    epa = pick("epa", "total_epa")  # player EPA sums to team EPA (approx)
+
+    # Third-down conversions sometimes appear only in PBP aggregations; leave NaN if missing
+    # Build a dictionary of aggregations
+    agg_map = {}
+    for col in [pass_yds, pass_att, pass_cmp, interceptions, rush_yds, rush_att, fumbles_lost, points, epa]:
+        if col is not None:
+            agg_map[col] = "sum"
+
+    grouped = df.groupby([team_col, opp_col], dropna=False).agg(agg_map).reset_index()
+    grouped = grouped.rename(columns={team_col: "Team", opp_col: "Opponent"})
+    grouped["Season"] = season
+    grouped["Week"] = week
+
+    # Derived rates
+    if pass_yds is not None and pass_att is not None:
+        grouped["YPA"] = grouped[pass_yds].apply(float) / grouped[pass_att].replace(0, np.nan)
+    else:
+        grouped["YPA"] = np.nan
+    if rush_yds is not None and rush_att is not None:
+        grouped["YPC"] = grouped[rush_yds].apply(float) / grouped[rush_att].replace(0, np.nan)
+    else:
+        grouped["YPC"] = np.nan
+    if pass_cmp is not None and pass_att is not None:
+        grouped["CMP%"] = (grouped[pass_cmp].apply(float) / grouped[pass_att].replace(0, np.nan)) * 100.0
+    else:
+        grouped["CMP%"] = np.nan
+
+    # Tidy friendly columns
+    rename_hint = {}
+    if pass_yds: rename_hint[pass_yds] = "PassYds"
+    if pass_att: rename_hint[pass_att] = "PassAtt"
+    if pass_cmp: rename_hint[pass_cmp] = "PassCmp"
+    if interceptions: rename_hint[interceptions] = "INT"
+    if rush_yds: rename_hint[rush_yds] = "RushYds"
+    if rush_att: rename_hint[rush_att] = "RushAtt"
+    if fumbles_lost: rename_hint[fumbles_lost] = "FumLost"
+    if points: rename_hint[points] = "Pts(approx)"
+    if epa: rename_hint[epa] = "EPA(sum)"
+    grouped = grouped.rename(columns=rename_hint)
+
+    # Reorder key columns up front
+    front_cols = ["Season", "Week", "Team", "Opponent", "PassYds", "RushYds", "PassAtt", "RushAtt", "PassCmp",
+                  "YPA", "YPC", "CMP%", "INT", "FumLost", "Pts(approx)", "EPA(sum)"]
+    front_cols = [c for c in front_cols if c in grouped.columns]
+    other_cols = [c for c in grouped.columns if c not in front_cols]
+    grouped = grouped[front_cols + other_cols]
+
+    return grouped
+
+
+def compute_defense_from_opponent(off_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert an offense table to the corresponding defense table for the opponent.
+    (i.e., what CHI allowed equals the opponent's offense)
+    """
+    if off_df.empty:
+        return off_df
+    df = off_df.copy()
+    df["DefenseTeam"] = df["Opponent"]
+    df["Opponent"] = df["Team"]
+    df["Team"] = df["DefenseTeam"]
+    df = df.drop(columns=["DefenseTeam"])
+    # Rename a few columns to "Allowed" if present
+    rename_map = {}
+    for col in ["PassYds", "RushYds", "YPA", "YPC", "CMP%", "INT", "FumLost", "Pts(approx)", "EPA(sum)"]:
+        if col in df.columns:
+            rename_map[col] = f"{col} Allowed"
+    df = df.rename(columns=rename_map)
+    return df
+
+
+def compute_league_averages(offense_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-week NFL averages from team offense totals (all teams, all games) for the season.
+    """
+    if offense_df.empty:
+        return offense_df
+    # Average by Week across teams
+    metric_cols = [c for c in offense_df.columns if c not in ["Season", "Week", "Team", "Opponent"]]
+    avg = offense_df.groupby(["Season", "Week"], dropna=False)[metric_cols].mean(numeric_only=True).reset_index()
+    avg["Team"] = "NFL_AVG"
+    avg["Opponent"] = "—"
+    return avg
+
+
+def try_import_snap_counts(season: int) -> pd.DataFrame:
+    """
+    Try a few function names because nfl_data_py has added/renamed functions across versions.
+    Falls back to empty DataFrame if unavailable.
+    """
+    candidates = [
+        "import_snap_counts",
+        "import_weekly_snap_counts",
+        "import_pfr_snap_counts",
+        "import_participation",  # sometimes has participation/snap-like info
+    ]
+    for fn in candidates:
+        try:
+            f = getattr(nfl, fn)
+            df = f([season])
+            # Expect team, season, week, player, snaps or pct
+            return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def filter_team_week(df: pd.DataFrame, team: str, season: int, week: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cols = df.columns.str.lower()
+    # team column guess
+    team_cols = ["team", "recent_team", "club", "posteam", "defteam"]
+    tc = None
+    for c in team_cols:
+        if c in cols:
+            tc = df.columns[list(cols).index(c)]
+            break
+    # week column
+    wc = "week" if "week" in cols else None
+    sc = "season" if "season" in cols else None
+    q = df.copy()
+    if sc:
+        q = q[q[sc] == season]
+    if wc:
+        q = q[q[wc] == week]
+    if tc:
+        q = q[q[tc] == team]
+    return q
+
+
+def to_excel_download(dataframes: List[Tuple[str, pd.DataFrame]], fname: str = "bears_tracker.xlsx") -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for sheet, df in dataframes:
+            # cap at Excel's sheet name limits
+            writer_sheet = sheet[:31] if len(sheet) > 31 else sheet
+            df.to_excel(writer, index=False, sheet_name=writer_sheet)
+    bio.seek(0)
+    return bio.read()
+
+
+def make_blank_template(kind: str, season: int) -> pd.DataFrame:
+    weeks = list(range(1, 18))
+    if kind == "offense":
+        cols = ["Season", "Week", "Team", "Opponent", "PassYds", "RushYds", "PassAtt", "RushAtt",
+                "PassCmp", "YPA", "YPC", "CMP%", "INT", "FumLost", "Pts(approx)", "EPA(sum)"]
+    elif kind == "defense":
+        cols = ["Season", "Week", "Team", "Opponent", "PassYds Allowed", "RushYds Allowed", "YPA Allowed",
+                "YPC Allowed", "CMP% Allowed", "INT Allowed", "FumLost Allowed", "Pts Allowed (approx)",
+                "EPA Allowed (sum)"]
+    elif kind == "snaps":
+        cols = ["Season", "Week", "Team", "Player", "Position", "Snaps", "Snap%"]
+    else:
+        cols = ["Season", "Week"]
+    df = pd.DataFrame([{c: None for c in cols} for _ in weeks])
+    df["Season"] = season
+    df["Week"] = weeks
+    if "Team" in df.columns:
+        df["Team"] = TEAM
+    return df
+
+
+# -----------------------------
+# UI - Controls
+# -----------------------------
+st.title("🐻 Bears Weekly Tracker — Clean Build")
+
+with st.sidebar:
+    st.header("Weekly Controls")
+    season = st.number_input("Season", min_value=2012, max_value=2100, value=SEASON_DEFAULT, step=1)
+    week = st.number_input("Week", min_value=1, max_value=22, value=1, step=1)
+    opp_list = get_opponent_menu(season, TEAM)
+    opponent = st.selectbox("Opponent", options=opp_list, index=0)
+
+    st.divider()
+    st.header("Templates (CSV)")
+    t1 = make_blank_template("offense", season)
+    t2 = make_blank_template("defense", season)
+    t3 = make_blank_template("snaps", season)
+
+    st.download_button(
+        "⬇️ Bears Offense (17 weeks CSV)",
+        data=t1.to_csv(index=False).encode("utf-8"),
+        file_name=f"bears_offense_template_{season}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+    st.download_button(
+        "⬇️ Bears Defense (17 weeks CSV)",
+        data=t2.to_csv(index=False).encode("utf-8"),
+        file_name=f"bears_defense_template_{season}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+    st.download_button(
+        "⬇️ CHI Snap Counts (17 weeks CSV)",
+        data=t3.to_csv(index=False).encode("utf-8"),
+        file_name=f"bears_snaps_template_{season}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+st.caption("Tip: Use the buttons below to auto-fetch. You’ll review & approve before saving.")
+
+
+# -----------------------------
+# Fetch Buttons
+# -----------------------------
+colA, colB, colC = st.columns([1,1,1])
+
+with colA:
+    fetch_btn = st.button("🔄 Fetch CHI & Opp team stats (Weekly)")
+with colB:
+    fetch_snaps_btn = st.button("🔄 Fetch CHI snap counts (Weekly)")
+with colC:
+    recompute_avg_btn = st.button("🧮 Recompute NFL weekly averages (from fetched data)")
+
+# Storage convenience
+latest = st.session_state.latest_fetch
+
+
+# -----------------------------
+# Fetch: CHI, OPP offense/defense
+# -----------------------------
+if fetch_btn:
+    try:
+        wp = import_weekly_player_data(season)
+        team_totals = team_week_totals_from_players(wp, season, week)
+
+        # Pull CHI row and OPP row
+        row_chi = team_totals[team_totals["Team"] == TEAM].copy()
+        row_opp = team_totals[team_totals["Team"] == opponent].copy()
+
+        # If we didn't find rows (bye or data lag), keep empty frames
+        off_chi = row_chi.reset_index(drop=True)
+        off_opp = row_opp.reset_index(drop=True)
+
+        # Derive defenses from opponent offenses (what each allowed)
+        def_chi = compute_defense_from_opponent(off_opp)  # what CHI allowed = OPP offense
+        def_opp = compute_defense_from_opponent(off_chi)  # what OPP allowed = CHI offense
+
+        latest["off_chi"] = off_chi
+        latest["off_opp"] = off_opp
+        latest["def_chi"] = def_chi
+        latest["def_opp"] = def_opp
+
+        st.success("Fetched weekly team totals for CHI and opponent.")
+    except Exception as e:
+        st.error(f"Could not fetch weekly team totals: {e}")
+
+# -----------------------------
+# Fetch: CHI snap counts
+# -----------------------------
+if fetch_snaps_btn:
+    try:
+        snaps_all = try_import_snap_counts(season)
+        snaps_chi = filter_team_week(snaps_all, TEAM, season, week)
+        latest["snaps_chi"] = snaps_chi.reset_index(drop=True)
+        if snaps_chi.empty:
+            st.warning("No snap count function available (or no data for this week). Use template CSV to upload instead.")
+        else:
+            st.success("Fetched weekly CHI snap counts.")
+    except Exception as e:
+        st.error(f"Could not fetch snap counts: {e}")
+
+# -----------------------------
+# Compute NFL weekly averages from what we fetched (all teams in week)
+# -----------------------------
+if recompute_avg_btn:
+    try:
+        # For NFL averages we need all teams in the week.
+        # We’ll re-pull the weekly player data and aggregate across all teams.
+        wp = import_weekly_player_data(season)
+        tt = team_week_totals_from_players(wp, season, week)  # all teams
+        nfl_avg = compute_league_averages(tt)
+        latest["nfl_avg_week"] = nfl_avg
+        st.success("Recomputed NFL per-week averages.")
+    except Exception as e:
+        st.error(f"Could not compute NFL weekly averages: {e}")
+
+
+# -----------------------------
+# Review & Approve
+# -----------------------------
+st.subheader("Review & Approve — This Week’s Data")
+
+with st.expander(f"👀 Preview fetched tables for Season {season}, Week {week}"):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Bears Offense (This Week)**")
+        st.dataframe(latest.get("off_chi", pd.DataFrame()))
+        st.markdown("**Opponent Offense (This Week)**")
+        st.dataframe(latest.get("off_opp", pd.DataFrame()))
+    with col2:
+        st.markdown("**Bears Defense (This Week)**")
+        st.dataframe(latest.get("def_chi", pd.DataFrame()))
+        st.markdown("**Opponent Defense (This Week)**")
+        st.dataframe(latest.get("def_opp", pd.DataFrame()))
+    st.markdown("**CHI Snap Counts (This Week)**")
+    st.dataframe(latest.get("snaps_chi", pd.DataFrame()))
+
+approve = st.button("✅ Approve & Save this Week")
+if approve:
+    frames = []
+    for key in ["off_chi", "off_opp", "def_chi", "def_opp", "snaps_chi"]:
+        df = latest.get(key, pd.DataFrame())
+        if not df.empty:
+            frames.append(df.copy())
+    if frames:
+        approved = pd.concat([st.session_state.approved_weeks] + frames, ignore_index=True)
+        # Drop duplicate (Season, Week, Team, Opponent) rows to prevent double-approval
+        # (For snap counts, Opponent may not exist; safe subset.)
+        subset = [c for c in ["Season", "Week", "Team", "Opponent"] if c in approved.columns]
+        approved = approved.drop_duplicates(subset=subset, keep="last")
+        st.session_state.approved_weeks = approved
+        st.success("Saved. Your YTD tables will reflect this immediately.")
+    else:
+        st.info("Nothing to save (no fetched tables).")
+
+
+# -----------------------------
+# YTD Tables (built from approved weeks)
+# -----------------------------
+st.subheader("📊 YTD Summary (Approved Weeks Only)")
+
+aw = st.session_state.approved_weeks.copy()
+
+# Split into offense/defense/snap subsets if present
+def is_offense(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    # If it has "YPA" (not Allowed) we’ll consider it offense
+    cols = df.columns
+    has_off = any(c == "YPA" for c in cols) or any(c == "YPC" for c in cols) or "PassYds" in cols
+    # If it has " Allowed", it's defense not offense.
+    has_allowed = any("Allowed" in c for c in cols)
+    return df if (has_off and not has_allowed) else pd.DataFrame()
+
+def is_defense(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    has_allowed = any("Allowed" in c for c in df.columns)
+    return df if has_allowed else pd.DataFrame()
+
+def is_snaps(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    return df if ("Player" in df.columns or "player_name" in df.columns) else pd.DataFrame()
+
+off_ytd = is_offense(aw)
+def_ytd = is_defense(aw)
+snaps_ytd = is_snaps(aw)
+
+colY1, colY2 = st.columns(2)
+with colY1:
+    st.markdown("**YTD — CHI Offense (rows by week)**")
+    st.dataframe(off_ytd[off_ytd["Team"] == TEAM] if not off_ytd.empty else pd.DataFrame())
+
+with colY2:
+    st.markdown("**YTD — CHI Defense (rows by week)**")
+    st.dataframe(def_ytd[def_ytd["Team"] == TEAM] if not def_ytd.empty else pd.DataFrame())
+
+st.markdown("**YTD — CHI Snap Counts**")
+st.dataframe(snaps_ytd[snaps_ytd.get("Team", TEAM) == TEAM] if not snaps_ytd.empty else pd.DataFrame())
+
+# Optional simple per-week NFL average from approved weeks (offense only)
+try:
+    if not off_ytd.empty:
+        nfl_avg_from_saved = compute_league_averages(off_ytd.dropna(subset=["Week"]))
+        nfl_avg_from_saved = nfl_avg_from_saved.sort_values(["Season", "Week"])
+    else:
+        nfl_avg_from_saved = pd.DataFrame()
+except Exception:
+    nfl_avg_from_saved = pd.DataFrame()
+
+st.markdown("**YTD — NFL Offense Averages (from approved weeks)**")
+st.dataframe(nfl_avg_from_saved)
+
+
+# -----------------------------
+# Weekly + YTD Export (Excel)
+# -----------------------------
+st.subheader("📤 Export")
+
+# Current week tables to include (even if not yet approved)
+weekly_tabs = []
+for label, key in [
+    ("Wk Offense CHI", "off_chi"),
+    ("Wk Offense OPP", "off_opp"),
+    ("Wk Defense CHI", "def_chi"),
+    ("Wk Defense OPP", "def_opp"),
+    ("Wk CHI Snaps", "snaps_chi"),
+    ("Wk NFL Avg", "nfl_avg_week")
+]:
+    df = latest.get(key, pd.DataFrame())
+    weekly_tabs.append((label, df if not df.empty else pd.DataFrame()))
+
+# YTD tabs (approved only)
+ytd_tabs = [
+    ("YTD Offense", off_ytd if not off_ytd.empty else pd.DataFrame()),
+    ("YTD Defense", def_ytd if not def_ytd.empty else pd.DataFrame()),
+    ("YTD Snaps", snaps_ytd if not snaps_ytd.empty else pd.DataFrame()),
+    ("YTD NFL Avg (from saved)", nfl_avg_from_saved if not nfl_avg_from_saved.empty else pd.DataFrame()),
+]
+
+export_bytes = to_excel_download(weekly_tabs + ytd_tabs, fname="bears_tracker.xlsx")
+st.download_button(
+    label="⬇️ Download Excel (Weekly + YTD)",
+    data=export_bytes,
+    file_name=f"bears_tracker_{season}_wk{week}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True
+)
+
+# -----------------------------
+# Manual Uploads (if auto-fetch isn’t available)
+# -----------------------------
+st.subheader("📥 Optional: Manual Uploads (if auto-fetch not available)")
+
+up_col1, up_col2, up_col3 = st.columns(3)
+
+with up_col1:
+    up_off = st.file_uploader("Upload Bears Offense (CSV/XLSX)", type=["csv", "xlsx"], key="up_off")
+with up_col2:
+    up_def = st.file_uploader("Upload Bears Defense (CSV/XLSX)", type=["csv", "xlsx"], key="up_def")
+with up_col3:
+    up_snaps = st.file_uploader("Upload CHI Snap Counts (CSV/XLSX)", type=["csv", "xlsx"], key="up_snaps")
+
+def read_any(file) -> pd.DataFrame:
+    if file is None:
         return pd.DataFrame()
-    name = uploaded.name.lower()
+    name = file.name.lower()
     try:
         if name.endswith(".csv"):
-            return pd.read_csv(uploaded)
-        return pd.read_excel(uploaded)
+            return pd.read_csv(file)
+        else:
+            return pd.read_excel(file)
     except Exception as e:
-        st.error(f"Could not read {uploaded.name}: {e}")
+        st.error(f"Could not read {file.name}: {e}")
         return pd.DataFrame()
 
-def make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    cols = pd.Series(df.columns, dtype=str)
-    for i in range(len(cols)):
-        dup_count = (cols[:i] == cols[i]).sum()
-        if dup_count:
-            cols[i] = f"{cols[i]}_{dup_count+1}"
-    df.columns = cols
-    return df
+if up_off or up_def or up_snaps:
+    manual_frames = []
+    m_off = normalize_week_col(read_any(up_off))
+    m_def = normalize_week_col(read_any(up_def))
+    m_snp = normalize_week_col(read_any(up_snaps))
+    if not m_off.empty:
+        st.markdown("**Preview — Uploaded Bears Offense**")
+        st.dataframe(m_off.head(20))
+        manual_frames.append(m_off)
+    if not m_def.empty:
+        st.markdown("**Preview — Uploaded Bears Defense**")
+        st.dataframe(m_def.head(20))
+        manual_frames.append(m_def)
+    if not m_snp.empty:
+        st.markdown("**Preview — Uploaded CHI Snap Counts**")
+        st.dataframe(m_snp.head(20))
+        manual_frames.append(m_snp)
 
-def find_week_col(df: pd.DataFrame) -> Optional[str]:
-    for c in COMMON_WEEK_COLS:
-        if c in df.columns:
-            return c
-    return None
+    if st.button("✅ Approve & Save Uploaded"):
+        if manual_frames:
+            approved = pd.concat([st.session_state.approved_weeks] + manual_frames, ignore_index=True)
+            subset = [c for c in ["Season", "Week", "Team", "Opponent", "Player"] if c in approved.columns]
+            approved = approved.drop_duplicates(subset=subset, keep="last")
+            st.session_state.approved_weeks = approved
+            st.success("Uploaded data saved to YTD.")
 
-def ensure_week_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    wk = find_week_col(df)
-    if wk:
-        df[wk] = pd.to_numeric(df[wk], errors="coerce")
-        df = df.dropna(subset=[wk])
-        df[wk] = df[wk].astype(int)
-    return df
 
-def rename_week_to_standard(df: pd.DataFrame) -> pd.DataFrame:
-    wk = find_week_col(df)
-    if wk and wk != "Week":
-        return df.rename(columns={wk: "Week"})
-    return df
-
-def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    for c in df.columns:
-        if c in TEAM_COLS_SKIP_NUMERIC:
-            continue
-        df[c] = pd.to_numeric(df[c], errors="ignore")
-    return df
-
-def auto_compute_nfl_averages(league_df: pd.DataFrame, metric_group: str) -> pd.DataFrame:
-    """From league-wide weekly dataframe (all teams), compute per-week NFL averages."""
-    if league_df is None or league_df.empty:
-        return pd.DataFrame()
-    df = league_df.copy()
-    df = rename_week_to_standard(df)
-    df = ensure_week_numeric(df)
-    df = coerce_numeric(df)
-    df = rename_aliases(df, is_offense=(metric_group == "off"))
-    cands = OFF_CANDIDATES if metric_group == "off" else DEF_CANDIDATES
-    cols = ["Week"] + [c for c in cands if c in df.columns]
-    if len(cols) == 1:
-        return pd.DataFrame()
-    nfl_avg = df[cols].groupby("Week", as_index=False).mean(numeric_only=True)
-    return nfl_avg
-
-def ytd_pairwise_mean(bears_df: pd.DataFrame, nfl_df: pd.DataFrame) -> pd.DataFrame:
-    if bears_df is None or bears_df.empty or nfl_df is None or nfl_df.empty:
-        return pd.DataFrame()
-    b_num = bears_df.select_dtypes(include=[np.number])
-    n_num = nfl_df.select_dtypes(include=[np.number])
-    common = [c for c in b_num.columns if c in n_num.columns]
-    if not common:
-        return pd.DataFrame()
-    return pd.DataFrame({
-        "Bears YTD": b_num[common].mean(),
-        "NFL Avg YTD": n_num[common].mean()
-    })
-
-# ------------- Sidebar -------------
-st.sidebar.header("Sections")
-st.sidebar.markdown("""
-1) Weekly Controls  
-2) Upload Game Data  
-3) Opponent Preview  
-4) Injuries  
-5) Predictions  
-6) Exports  
-7) **Charts (bottom)**
-""")
-
-st.sidebar.divider()
-st.sidebar.subheader("Excel")
-export_entire_excel_download()
-
-st.sidebar.divider()
-# ----- Sidebar: NFL averages inputs -----
-st.sidebar.subheader("NFL Averages Inputs")
-nfl_off_file = st.sidebar.file_uploader("Upload NFL Offense Averages (per week)", type=["csv", "xlsx"], key="nfl_off")
-nfl_def_file = st.sidebar.file_uploader("Upload NFL Defense Averages (per week)", type=["csv", "xlsx"], key="nfl_def")
-st.sidebar.caption("— OR — upload league-wide weekly files (all teams, all weeks)")
-league_off_all_file = st.sidebar.file_uploader("Upload League-wide Offense Weekly (all teams)", type=["csv", "xlsx"], key="lg_off_all")
-league_def_all_file = st.sidebar.file_uploader("Upload League-wide Defense Weekly (all teams)", type=["csv", "xlsx"], key="lg_def_all")
-
-# ------------- Ensure workbook exists -------------
-ensure_workbook(EXCEL_FILE)
-
-# ------------- 1) Weekly Controls -------------
-st.header("1) Weekly Controls")
-with st.form("weekly_controls_form", clear_on_submit=False):
-    colA, colB, colC, colD = st.columns(4)
-    week = colA.number_input("Week", min_value=1, step=1, format="%d")
-    opponent = colB.text_input("Opponent (3-letter code, e.g., MIN, GB)")
-    venue = colC.selectbox("Home/Away", ["Home", "Away"])
-    notes = colD.text_input("Key Notes (one-liner)")
-
-    submitted_wc = st.form_submit_button("Save Weekly Control Note")
-    if submitted_wc:
-        df = pd.DataFrame([{
-            "Week": int(week),
-            "Opponent": opponent.strip(),
-            "Venue": venue,
-            "Key_Notes": notes.strip(),
-            "Timestamp": datetime.now().isoformat(timespec="seconds")
-        }])
-        save_append(df, "MediaSummaries", keys=["Week", "Opponent", "Key_Notes"])
-        st.success("Weekly control note saved.")
-
-# ------------- 2) Upload Game Data -------------
-st.header("2) Upload Game Data (CSV/XLSX)")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    off_up = st.file_uploader("Bears Offense (weekly)", type=["csv", "xlsx"], key="off_upl")
-    if off_up:
-        df = read_any(off_up)
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        df = coerce_numeric(df)
-        df = rename_aliases(df, is_offense=True)
-        save_append(df, "Offense", keys=["Week", "Opponent"] if "Opponent" in df.columns else ["Week"])
-        st.success("Offense data appended.")
-with c2:
-    def_up = st.file_uploader("Bears Defense (weekly)", type=["csv", "xlsx"], key="def_upl")
-    if def_up:
-        df = read_any(def_up)
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        df = coerce_numeric(df)
-        df = rename_aliases(df, is_offense=False)
-        save_append(df, "Defense", keys=["Week", "Opponent"] if "Opponent" in df.columns else ["Week"])
-        st.success("Defense data appended.")
-with c3:
-    per_up = st.file_uploader("Personnel (weekly)", type=["csv", "xlsx"], key="per_upl")
-    if per_up:
-        df = read_any(per_up)
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        save_append(df, "Personnel", keys=["Week"])
-        st.success("Personnel data appended.")
-with c4:
-    snaps_up = st.file_uploader("Snap Counts (weekly)", type=["csv", "xlsx"], key="snaps_upl")
-    if snaps_up:
-        df = read_any(snaps_up)
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        save_append(df, "SnapCounts", keys=["Week"])
-        st.success("Snap counts appended.")
-
-# Show last 10 rows quick view
-st.subheader("Latest Uploads (last 10 rows)")
-off = load_sheet("Offense")
-defn = load_sheet("Defense")
-personnel = load_sheet("Personnel")
-snaps = load_sheet("SnapCounts")
-
-cA, cB = st.columns(2)
-with cA:
-    st.markdown("**Bears Offense (weekly)**")
-    st.dataframe(make_unique_columns(off.tail(10)), width="stretch") if not off.empty else st.caption("—")
-with cB:
-    st.markdown("**Bears Defense (weekly)**")
-    st.dataframe(make_unique_columns(defn.tail(10)), width="stretch") if not defn.empty else st.caption("—")
-
-cC, cD = st.columns(2)
-with cC:
-    st.markdown("**Personnel (weekly)**")
-    st.dataframe(make_unique_columns(personnel.tail(10)), width="stretch") if not personnel.empty else st.caption("—")
-with cD:
-    st.markdown("**Snap Counts (weekly)**")
-    st.dataframe(make_unique_columns(snaps.tail(10)), width="stretch") if not snaps.empty else st.caption("—")
-
-# ------------- NFL averages load/compute -------------
-nfl_off_avg = read_any(nfl_off_file)
-nfl_def_avg = read_any(nfl_def_file)
-league_off_all = read_any(league_off_all_file)
-league_def_all = read_any(league_def_all_file)
-
-for df_name, is_off in [("nfl_off_avg", True), ("nfl_def_avg", False), ("league_off_all", True), ("league_def_all", False)]:
-    df = locals()[df_name]
-    if not df.empty:
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        df = coerce_numeric(df)
-        df = rename_aliases(df, is_offense=is_off)
-        locals()[df_name] = df
-
-if nfl_off_avg.empty and not league_off_all.empty:
-    nfl_off_avg = auto_compute_nfl_averages(league_off_all, "off")
-if nfl_def_avg.empty and not league_def_all.empty:
-    nfl_def_avg = auto_compute_nfl_averages(league_def_all, "def")
-
-# Save the latest NFL averages back into workbook for YTD use
-if not nfl_off_avg.empty:
-    save_append(nfl_off_avg, "NFL_Offense_Avg", keys=["Week"])
-if not nfl_def_avg.empty:
-    save_append(nfl_def_avg, "NFL_Defense_Avg", keys=["Week"])
-
-# Quick peek last 10 NFL averages
-st.subheader("NFL Averages (last 10 rows)")
-cE, cF = st.columns(2)
-with cE:
-    st.markdown("**NFL Offense Averages (per week)**")
-    st.dataframe(make_unique_columns(nfl_off_avg.tail(10)), width="stretch") if not nfl_off_avg.empty else st.caption("—")
-with cF:
-    st.markdown("**NFL Defense Averages (per week)**")
-    st.dataframe(make_unique_columns(nfl_def_avg.tail(10)), width="stretch") if not nfl_def_avg.empty else st.caption("—")
-
-# ----- Data Maintenance: delete rows by week (to remove old GB Week 1, etc.) -----
-with st.expander("🧹 Data Maintenance (delete rows by week)"):
-    del_week = st.number_input("Week to delete across all sheets", min_value=1, step=1, format="%d")
-    if st.button("Delete rows for this week (ALL sheets)"):
-        for sheet in ["Offense","Defense","Personnel","SnapCounts","Injuries","OpponentPreview","MediaSummaries","Predictions",
-                      "NFL_Offense_Avg","NFL_Defense_Avg","YTD_Team_Offense","YTD_Team_Defense"]:
-            df = load_sheet(sheet)
-            if not df.empty and "Week" in df.columns:
-                df = df[df["Week"] != int(del_week)]
-                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-                    df.to_excel(w, sheet_name=sheet, index=False)
-        st.success(f"Deleted Week {int(del_week)} from all sheets that had it.")
-
-st.divider()
-
-# ------------- 3) Opponent Preview -------------
-st.header("3) Opponent Preview")
-with st.form("opponent_preview_form", clear_on_submit=False):
-    c1, c2, c3 = st.columns(3)
-    wk = c1.number_input("Week", min_value=1, step=1, format="%d")
-    opp = c2.text_input("Opponent (3-letter code)")
-    preview = c3.text_input("Preview Headline")
-    details = st.text_area("Notes (matchups, tendencies, weather, etc.)", height=120)
-    sub = st.form_submit_button("Save Opponent Preview")
-    if sub:
-        df = pd.DataFrame([{
-            "Week": int(wk), "Opponent": opp.strip(),
-            "Preview_Headline": preview.strip(),
-            "Notes": details.strip(),
-            "Timestamp": datetime.now().isoformat(timespec="seconds")
-        }])
-        save_append(df, "OpponentPreview", keys=["Week", "Opponent"])
-        st.success("Opponent preview saved.")
-opprev = load_sheet("OpponentPreview")
-st.dataframe(make_unique_columns(opprev.tail(10)), width="stretch") if not opprev.empty else st.caption("—")
-
-# ------------- 4) Injuries -------------
-st.header("4) Injuries")
-with st.form("injuries_form", clear_on_submit=True):
-    c1, c2, c3, c4 = st.columns(4)
-    wk_i = c1.number_input("Week", min_value=1, step=1, format="%d")
-    opp_i = c2.text_input("Opponent (3-letter code)")
-    player = c3.text_input("Player")
-    status = c4.selectbox("Status", ["Questionable", "Doubtful", "Out", "IR", "Active"])
-    c5, c6, c7 = st.columns(3)
-    bodypart = c5.text_input("Body Part")
-    practice = c6.selectbox("Practice", ["DNP", "Limited", "Full", "N/A"])
-    game_status = c7.selectbox("Game Status", ["TBD", "Active", "Inactive", "N/A"])
-    notes_i = st.text_area("Notes", height=100)
-    save_i = st.form_submit_button("Save Injury")
-    if save_i:
-        df = pd.DataFrame([{
-            "Week": int(wk_i), "Opponent": opp_i.strip(),
-            "Player": player.strip(), "Status": status,
-            "BodyPart": bodypart.strip(), "Practice": practice,
-            "GameStatus": game_status, "Notes": notes_i.strip(),
-            "Timestamp": datetime.now().isoformat(timespec="seconds")
-        }])
-        save_append(df, "Injuries", keys=["Week", "Opponent", "Player"])
-        st.success("Injury saved.")
-inj = load_sheet("Injuries")
-st.dataframe(make_unique_columns(inj.tail(10)), width="stretch") if not inj.empty else st.caption("—")
-
-# ------------- 5) Predictions -------------
-st.header("5) Weekly Game Predictions")
-with st.form("pred_form", clear_on_submit=True):
-    c1, c2, c3, c4 = st.columns(4)
-    wk_p = c1.number_input("Week", min_value=1, step=1, format="%d")
-    opp_p = c2.text_input("Opponent (3-letter code)")
-    winner = c3.selectbox("Predicted Winner", ["CHI", "Opponent"])
-    conf = c4.slider("Confidence (0–100%)", 0, 100, 60)
-    rationale = st.text_area("Rationale (use strategy, injuries, matchups, YTD)", height=100)
-    save_p = st.form_submit_button("Save Prediction")
-    if save_p:
-        df = pd.DataFrame([{
-            "Week": int(wk_p), "Opponent": opp_p.strip(),
-            "Predicted_Winner": winner, "Confidence": conf,
-            "Rationale": rationale.strip(),
-            "Timestamp": datetime.now().isoformat(timespec="seconds")
-        }])
-        save_append(df, "Predictions", keys=["Week", "Opponent"])
-        st.success("Prediction saved.")
-preds = load_sheet("Predictions")
-st.dataframe(make_unique_columns(preds.tail(10)), width="stretch") if not preds.empty else st.caption("—")
-
-# Quick PDF generation for the current week’s report
-def build_week_pdf(week_num: int, out_path: str):
-    pdf = FPDF(orientation="P", unit="mm", format="Letter")
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, f"Chicago Bears Week {week_num} Report", ln=1, align="C")
-    pdf.set_font("Arial", "", 11)
-
-    def add_table(title: str, df: pd.DataFrame, max_rows=12):
-        pdf.ln(4)
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, title, ln=1)
-        pdf.set_font("Arial", "", 9)
-        if df is None or df.empty:
-            pdf.cell(0, 6, "—", ln=1)
-            return
-        cols = list(df.columns)
-        head = " | ".join([str(c)[:15] for c in cols[:6]])
-        pdf.cell(0, 5, head, ln=1)
-        for _, row in df.head(max_rows).iterrows():
-            line = " | ".join([str(row.get(c, ""))[:15] for c in cols[:6]])
-            pdf.cell(0, 5, line, ln=1)
-
-    off_w = off[off["Week"] == week_num] if "Week" in off.columns else pd.DataFrame()
-    def_w = defn[defn["Week"] == week_num] if "Week" in defn.columns else pd.DataFrame()
-    opp_w = opprev[opprev["Week"] == week_num] if "Week" in opprev.columns else pd.DataFrame()
-    inj_w = inj[inj["Week"] == week_num] if "Week" in inj.columns else pd.DataFrame()
-    pr_w = preds[preds["Week"] == week_num] if "Week" in preds.columns else pd.DataFrame()
-
-    add_table("Opponent Preview", opp_w)
-    add_table("Injuries", inj_w)
-    add_table("Offense (week)", off_w)
-    add_table("Defense (week)", def_w)
-    add_table("Prediction", pr_w)
-
-    pdf.output(out_path)
-
-st.subheader("Exports")
-colx, coly, colz = st.columns(3)
-with colx:
-    wk_exp_pre = st.number_input("Week to export (Pre)", min_value=1, step=1, format="%d", key="wkpre")
-    if st.button("Export Pre PDF"):
-        outfile = f"W{wk_exp_pre:02d}_Pre.pdf"
-        build_week_pdf(int(wk_exp_pre), outfile)
-        with open(outfile, "rb") as f:
-            st.download_button("Download Pre PDF", data=f, file_name=outfile, mime="application/pdf")
-        st.success("Pre PDF built.")
-with coly:
-    wk_exp_post = st.number_input("Week to export (Post)", min_value=1, step=1, format="%d", key="wkpost")
-    if st.button("Export Post PDF"):
-        outfile = f"W{wk_exp_post:02d}_Post.pdf"
-        build_week_pdf(int(wk_exp_post), outfile)
-        with open(outfile, "rb") as f:
-            st.download_button("Download Post PDF", data=f, file_name=outfile, mime="application/pdf")
-        st.success("Post PDF built.")
-with colz:
-    wk_exp_final = st.number_input("Week to export (Final)", min_value=1, step=1, format="%d", key="wkfinal")
-    if st.button("Export Final PDF"):
-        outfile = f"W{wk_exp_final:02d}_Final.pdf"
-        build_week_pdf(int(wk_exp_final), outfile)
-        with open(outfile, "rb") as f:
-            st.download_button("Download Final PDF", data=f, file_name=outfile, mime="application/pdf")
-        st.success("Final PDF built.")
-
-st.divider()
-
-# ============================
-# 6) --- CHARTS AT THE BOTTOM
-# ============================
-
-# Quick debug panel so you can see why charts may not render
-with st.expander("🩺 Data Sanity / Chart Debug"):
-    def cols(df):
-        return list(df.columns) if not df.empty else []
-    # Use the freshest frames available for debug
-    nfl_off_dbg = nfl_off_avg if not nfl_off_avg.empty else load_sheet("NFL_Offense_Avg")
-    nfl_def_dbg = nfl_def_avg if not nfl_def_avg.empty else load_sheet("NFL_Defense_Avg")
-    st.write("Off (rows, cols):", off.shape, "Columns:", cols(off))
-    st.write("Def (rows, cols):", defn.shape, "Columns:", cols(defn))
-    st.write("NFL Off Avg (rows, cols):", (nfl_off_dbg.shape if isinstance(nfl_off_dbg, pd.DataFrame) else (0,0)), "Columns:", cols(nfl_off_dbg))
-    st.write("NFL Def Avg (rows, cols):", (nfl_def_dbg.shape if isinstance(nfl_def_dbg, pd.DataFrame) else (0,0)), "Columns:", cols(nfl_def_dbg))
-    off_overlap = [c for c in OFF_CANDIDATES if c in off.columns and isinstance(nfl_off_dbg, pd.DataFrame) and c in nfl_off_dbg.columns]
-    def_overlap = [c for c in DEF_CANDIDATES if c in defn.columns and isinstance(nfl_def_dbg, pd.DataFrame) and c in nfl_def_dbg.columns]
-    st.write("Offense overlapping metrics:", off_overlap)
-    st.write("Defense overlapping metrics:", def_overlap)
-    st.write("Has Week in Off/NFL-Off:", ("Week" in off.columns), (isinstance(nfl_off_dbg, pd.DataFrame) and "Week" in nfl_off_dbg.columns))
-    st.write("Has Week in Def/NFL-Def:", ("Week" in defn.columns), (isinstance(nfl_def_dbg, pd.DataFrame) and "Week" in nfl_def_dbg.columns))
-
-st.header("6) Charts — Bears vs NFL Averages (Weekly & YTD)")
-st.caption("These charts appear **after** Weekly Controls, Uploads, Opponent Preview, Injuries, Predictions, and Exports.")
-
-# Re-load latest (in case just appended)
-off = load_sheet("Offense")
-defn = load_sheet("Defense")
-nfl_off_avg_sheet = load_sheet("NFL_Offense_Avg")
-nfl_def_avg_sheet = load_sheet("NFL_Defense_Avg")
-
-# prefer current session uploads when present
-nfl_off_avg_chart = nfl_off_avg.copy() if not nfl_off_avg.empty else nfl_off_avg_sheet.copy()
-nfl_def_avg_chart = nfl_def_avg.copy() if not nfl_def_avg.empty else nfl_def_avg_sheet.copy()
-
-# Normalize numeric + Week + aliases again for chart copies
-for name, is_off in [("off", True), ("defn", False), ("nfl_off_avg_chart", True), ("nfl_def_avg_chart", False)]:
-    df = locals()[name]
-    if not df.empty:
-        df = rename_week_to_standard(df)
-        df = ensure_week_numeric(df)
-        df = coerce_numeric(df)
-        df = rename_aliases(df, is_offense=is_off)
-        locals()[name] = df
-
-def plot_weekly(bears_df: pd.DataFrame, nfl_df: pd.DataFrame, title: str, candidates: list[str]):
-    if bears_df.empty or nfl_df.empty:
-        st.info(f"{title}: upload Bears weekly and NFL averages (or league-wide) to see this chart.")
-        return
-    present = [c for c in candidates if c in bears_df.columns and c in nfl_df.columns]
-    if not present:
-        st.warning(f"{title}: no overlapping metric columns found.")
-        return
-    if "Week" not in bears_df.columns or "Week" not in nfl_df.columns:
-        st.warning(f"{title}: missing 'Week' column.")
-        return
-
-    fig, ax = plt.subplots()
-    for col in present:
-        try:
-            ax.plot(bears_df["Week"], bears_df[col], marker="o", label=f"Bears {col}")
-        except Exception:
-            pass
-        try:
-            ax.plot(nfl_df["Week"], nfl_df[col], linestyle="--", label=f"NFL Avg {col}")
-        except Exception:
-            pass
-    ax.set_title(title)
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Value")
-    ax.legend()
-    st.pyplot(fig)
-
-def plot_ytd(bears_df: pd.DataFrame, nfl_df: pd.DataFrame, title: str):
-    if bears_df.empty or nfl_df.empty:
-        st.info(f"{title}: upload Bears weekly and NFL averages (or league-wide) to see this chart.")
-        return
-    ytd_df = ytd_pairwise_mean(bears_df, nfl_df)
-    if ytd_df.empty:
-        st.warning(f"{title}: no overlapping numeric columns to aggregate.")
-        return
-    fig, ax = plt.subplots()
-    ytd_df.sort_index().plot(kind="bar", ax=ax)
-    ax.set_title(title)
-    ax.set_ylabel("Average Value")
-    st.pyplot(fig)
-
-# --- Weekly Offense vs NFL ---
-plot_weekly(off, nfl_off_avg_chart, "Bears Offense vs NFL Average by Week", OFF_CANDIDATES)
-# --- YTD Offense vs NFL ---
-plot_ytd(off, nfl_off_avg_chart, "YTD Offense: Bears vs NFL Average")
-
-st.divider()
-
-# --- Weekly Defense vs NFL ---
-plot_weekly(defn, nfl_def_avg_chart, "Bears Defense vs NFL Average by Week", DEF_CANDIDATES)
-# --- YTD Defense vs NFL ---
-plot_ytd(defn, nfl_def_avg_chart, "YTD Defense: Bears vs NFL Average")
-
-# Tips
-with st.expander("ℹ️ Charting Tips & Column Names"):
+# -----------------------------
+# Minimal Data Notes
+# -----------------------------
+with st.expander("ℹ️ What data is collected (exactly)?", expanded=False):
     st.markdown("""
-- Be sure your weekly files include a **Week** column. We accept `week`/`WEEK` automatically.
-- Offense metrics we look for:  
-  `YPA, YPC, CMP%, 3D%, RZ%, EPA/Play, SR%, PTS/G, Yds/G, TO/G`.
-- Defense metrics we look for:  
-  `SACK, INT, FF, FR, QB Hits, Pressures, RZ% Allowed, 3D% Allowed, EPA/Play Allowed, SR% Allowed, Pts Allowed/G, Yds Allowed/G, DVOA`.
-- If a metric doesn’t appear, make sure it exists **in both** Bears and NFL frames with the **same column name**.
+- **Team Weekly Offense** (from `nfl_data_py.import_weekly_data` aggregated to team by week):
+  - *If present in your package build*: `PassYds, RushYds, PassAtt, RushAtt, PassCmp, INT, FumLost, Pts(approx), EPA(sum)`.
+  - Derived: `YPA, YPC, CMP%`.
+- **Team Weekly Defense**: mirrored from the opponent’s offense (e.g., `PassYds Allowed`, etc.).
+- **CHI Snap Counts** (best-effort):
+  - Tries one of: `import_snap_counts`, `import_weekly_snap_counts`, `import_pfr_snap_counts`, or `import_participation`.
+  - If none exist, use the provided **Snap Counts template**.
+- **NFL Weekly Averages**:
+  - Mean across all teams' weekly offense totals for each **Season, Week**.
+- You always **review & approve** before data is added to your YTD tables.
 """)
+
+
+# End of app
