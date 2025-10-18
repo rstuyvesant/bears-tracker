@@ -1,9 +1,6 @@
-# Core app
 streamlit==1.49.1
 pandas==2.2.3
 numpy==2.1.3
-
-# Data fetching / IO
 nfl_data_py==0.3.3
 pyarrow==17.0.0
 openpyxl==3.1.5
